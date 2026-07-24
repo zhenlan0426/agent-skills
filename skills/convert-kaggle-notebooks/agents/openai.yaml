@@ -1,0 +1,4 @@
+interface:
+  display_name: "Convert Kaggle Notebooks"
+  short_description: "Turn Kaggle notebooks into readable Python"
+  default_prompt: "Use $convert-kaggle-notebooks to convert this Kaggle notebook into a readable Python script."

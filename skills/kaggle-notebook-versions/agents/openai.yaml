@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kaggle Notebook Versions"
+  short_description: "Download exact historic Kaggle notebook versions"
+  default_prompt: "Use $kaggle-notebook-versions to download version 58 of a Kaggle notebook."

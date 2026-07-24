@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# skill -- manage the shared Claude Code / Codex skill repo.
+#
+#   skill new <name>    scaffold a skill and project it into both tools
+#   skill rm <name>     delete a skill and prune its links from both tools
+#   skill ls            list skills and where each one is visible
+#   skill sync          converge everything (also runs from session hooks)
+#   skill save [msg]    git commit the current state of skills/
+#   skill doctor        report anything the sync model can't resolve alone
+
+set -uo pipefail
+REPO="${AGENT_SKILLS_REPO:-$HOME/agent-skills}"
+SKILLS="$REPO/skills"
+SYNC="$REPO/bin/sync.sh"
+CLAUDE_DIR="$HOME/.claude/skills"
+CODEX_DIR="$HOME/.codex/skills"
+
+die() { printf 'skill: %s\n' "$*" >&2; exit 1; }
+
+cmd_new() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: skill new <name>"
+  [ -e "$SKILLS/$name" ] && die "'$name' already exists"
+  case "$name" in *[!a-zA-Z0-9_-]*) die "name must be [a-zA-Z0-9_-]" ;; esac
+  mkdir -p "$SKILLS/$name"
+  cat > "$SKILLS/$name/SKILL.md" <<EOF
+---
+name: $name
+description: TODO one paragraph -- what this does AND when to use it. Both tools
+  match on this text, so include the literal phrases you'd type to invoke it.
+---
+
+# ${name//-/ }
+
+TODO
+EOF
+  "$SYNC"
+  printf 'created %s/SKILL.md\n' "$SKILLS/$name"
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: skill rm <name>"
+  [ -d "$SKILLS/$name" ] || die "no skill '$name' in the repo"
+  printf "delete '%s' from the repo and both tools? [y/N] " "$name"
+  read -r reply
+  case "$reply" in [yY]*) ;; *) echo "aborted"; return 1 ;; esac
+  rm -rf "${SKILLS:?}/$name"
+  "$SYNC"   # prunes the now-dangling links
+}
+
+cmd_ls() {
+  local path name c x
+  for path in "$SKILLS"/*/; do
+    [ -e "$path" ] || continue
+    path="${path%/}"; name="${path##*/}"
+    [ -f "$path/SKILL.md" ] || continue
+    c=" - "; x=" - "
+    [ -e "$CLAUDE_DIR/$name" ] && c="claude"
+    [ -e "$CODEX_DIR/$name" ]  && x="codex "
+    printf '%-32s %s %s\n' "$name" "$c" "$x"
+  done
+}
+
+cmd_save() {
+  local msg="${*:-skills: $(date +%Y-%m-%d\ %H:%M)}"
+  git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "not a git repo: $REPO"
+  git -C "$REPO" add -A
+  git -C "$REPO" diff --cached --quiet && { echo "nothing to commit"; return 0; }
+  git -C "$REPO" commit -q -m "$msg" && git -C "$REPO" log --oneline -1
+}
+
+cmd_doctor() {
+  local rc=0 path name
+  echo "repo:   $SKILLS"
+  echo "claude: $CLAUDE_DIR -> $(readlink -f "$CLAUDE_DIR")"
+  echo "codex:  $CODEX_DIR"
+  echo
+  [ "$(readlink -f "$CLAUDE_DIR")" = "$(readlink -f "$SKILLS")" ] \
+    || { echo "WARN  ~/.claude/skills is not mounted on the repo"; rc=1; }
+  for path in "$CODEX_DIR"/*/; do
+    [ -e "$path" ] || continue
+    path="${path%/}"; name="${path##*/}"
+    [ -L "$path" ] && continue
+    [ -f "$path/SKILL.md" ] && { echo "WARN  unadopted skill in codex: $name"; rc=1; }
+  done
+  find "$CLAUDE_DIR" "$CODEX_DIR" -maxdepth 1 -xtype l 2>/dev/null \
+    | while read -r d; do echo "WARN  dangling link: $d"; done
+  for path in "$SKILLS"/*/; do
+    [ -e "$path" ] || continue
+    path="${path%/}"; name="${path##*/}"
+    [ -f "$path/SKILL.md" ] || { echo "WARN  no SKILL.md: $name"; rc=1; continue; }
+    grep -q '^name:[[:space:]]*'"$name"'[[:space:]]*$' "$path/SKILL.md" \
+      || echo "WARN  frontmatter 'name:' does not match dir name: $name"
+  done
+  [ "$rc" = 0 ] && echo "OK    everything converged"
+  return "$rc"
+}
+
+case "${1:-}" in
+  new)    shift; cmd_new "$@" ;;
+  rm)     shift; cmd_rm "$@" ;;
+  ls|"")  cmd_ls ;;
+  sync)   shift; "$SYNC" "$@" ;;
+  save)   shift; cmd_save "$@" ;;
+  doctor) cmd_doctor ;;
+  *)      die "unknown command '$1' (new|rm|ls|sync|save|doctor)" ;;
+esac
