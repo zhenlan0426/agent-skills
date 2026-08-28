@@ -1,11 +1,13 @@
 # system-map.yaml schema
 
-The data file is the single source of truth. Edit it; never hand-edit the
-rendered HTML. Every field holding prose supports minimal markdown:
+The data file is the single source of truth for the **high-level page**. Edit
+it; never hand-edit `system-map.html`. Detail does not live here at all — it
+lives in hand-authored deep-dive pages, one per top-level component, linked
+from the map (see [deep-dive-pages.md](deep-dive-pages.md)). Every field holding prose supports minimal markdown:
 paragraphs separated by blank lines, `- ` bullets, `` `code` ``, `**bold**`.
 
 Write all prose for the human owner: plain language, no unexplained jargon.
-Any term of art used in `overview`, `summary`, `details`, or `changelog`
+Any term of art used in `overview`, `summary`, or `changelog`
 should have a glossary entry — the renderer auto-links the first occurrence
 in each text block to its glossary definition with a hover tooltip.
 
@@ -21,17 +23,21 @@ meta:
 overview: |                       # L0 — must fit on one screen. What the system
   Plain-language description...   # does end to end, in the owner's vocabulary.
 
-components:                       # L1/L2 tree, drill-down via nesting
+components:                       # L1 tree, drill-down via nesting
   - name: Detection
     status: validated             # planned | in-progress | implemented | validated | abandoned
-    summary: One or two sentences. This is L1 — visible without expanding.
-    details: |                    # optional L2 — collapsed behind a click.
-      Contracts, knobs, caching, invariants. New detail goes HERE, not into
-      summary or overview: L0/L1 sizes are capped, L2 is not.
+    summary: One or two sentences. This is all the map shows for a node.
+    deep_dive:                    # optional; in practice on top-level components
+      file: docs/sysmap/detection.html      # the hand-authored page in this repo
+      url: https://claude.ai/code/artifact/...  # its published Artifact (set after first publish)
+      label: Deep dive            # optional link text, defaults to "Deep dive"
     children:                     # optional, same shape, arbitrarily deep
       - name: NMS
         status: implemented
         summary: ...
+
+# There is NO `details:` key. A details block in the YAML fails the render on
+# purpose: that prose belongs on the component's deep-dive page.
 
 glossary:
   - term: rung                    # matched case-insensitively, word-boundary
@@ -57,30 +63,32 @@ changelog:                        # NEWEST FIRST. Write each entry for someone
 | `in-progress` | Being implemented right now |
 | `implemented` | Code exists and passed review |
 | `validated` | Measured / tested end-to-end and shown to work or help |
-| `abandoned` | Tried and dropped — keep it, with the reason in `details`, so dead ideas aren't re-proposed |
+| `abandoned` | Tried and dropped — keep it, with the reason in the `summary` or on the deep-dive page, so dead ideas aren't re-proposed |
 
 The implemented/validated split is deliberate: "the code exists" and "it was
 measured and it helps" must be different colors.
 
 ## How the component tree renders
 
-The renderer draws two visual layers, so write for them:
+Every node renders as one headline: a numbered path badge (`2.4.1`, from tree
+position), the `name`, the status chip, and the `summary` underneath.
+Top-level components become cards with a status-coloured left edge; children
+are hairline-separated rows inside the card; grandchildren are indented behind
+a rule. A card is open on load, deeper nodes start collapsed. An
+"Expand all / Collapse all" pair sits above the tree.
 
-- **Headline layer, always visible** — a numbered path badge (`2.4.1`, from
-  tree position), the `name`, the status chip, and the `summary` underneath.
-  Top-level components become cards with a status-coloured left edge; children
-  are hairline-separated rows inside the card; grandchildren are indented
-  behind a rule. A card is open on load, deeper nodes start collapsed.
-- **Detail layer, one click away** — `details` sits behind a small dashed
-  `DETAIL` pill and opens into a tinted inset box.
+A `deep_dive` renders as a pill link under the summary — with a `url` it opens
+the published page in a new tab; with only a `file` it renders greyed as
+"not published yet", which is the reminder to publish it.
 
-So `summary` must read as a standalone one-liner (it is the only thing a
-scanner sees), and `details` must read as prose that stands on its own when
-opened. An "Expand all / Collapse all" pair sits above the tree.
+So `summary` must read as a standalone one-liner: it is the only prose the map
+carries for that node, and anything longer belongs on the deep-dive page.
 
 ## Size discipline
 
 - `overview`: one screen, hard cap. If it grows, push detail down.
 - Top-level components: aim for 4–9. More means the altitude is wrong.
-- `summary`: two sentences max. Everything else goes in `details`.
-- Unknown `status` values fail the render on purpose.
+- `summary`: two sentences max. Everything else goes on the deep-dive page.
+- The whole map should stay scannable in a couple of minutes. It is an index
+  with status colours, not a document.
+- Unknown `status` values, and any `details:` key, fail the render on purpose.

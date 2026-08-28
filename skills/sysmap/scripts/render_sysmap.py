@@ -4,6 +4,12 @@
 Deterministic: the same YAML always produces the same HTML. Agents edit the
 YAML; presentation lives here and only here.
 
+This page is the HIGH-LEVEL layer only: overview, the component tree with one
+status and one summary per node, the changelog and the glossary. Detail lives
+in hand-authored deep-dive pages (see references/deep-dive-pages.md), reached
+through the `deep_dive` link on a component. A `details:` key in the YAML is a
+hard error — that text belongs on a deep-dive page.
+
 Usage:
     render_sysmap.py path/to/system-map.yaml [-o output.html]
 
@@ -159,6 +165,28 @@ def status_chip(status):
     return '<span class="chip chip-%s">%s</span>' % (status, STATUS_LABEL[status])
 
 
+def deep_dive_link(deep, name):
+    """The one link out of the high-level page. `deep_dive.url` is the
+    published page; with only a `file`, say so rather than linking a path
+    the reader cannot open."""
+    if not deep:
+        return ""
+    label = esc(deep.get("label") or "Deep dive")
+    url = deep.get("url")
+    if url:
+        return (
+            '<div class="comp-deep"><a class="deep-link" href="%s" '
+            'target="_blank" rel="noopener">%s <span class="deep-arrow">'
+            "&#8599;</span></a></div>" % (esc(url), label)
+        )
+    if deep.get("file"):
+        return (
+            '<div class="comp-deep"><span class="deep-link deep-pending">'
+            "%s &middot; not published yet</span></div>" % label
+        )
+    sys.exit("deep_dive on %r needs a 'url' or a 'file'" % name)
+
+
 def render_component(comp, glossary, depth, path):
     """One component. Two visual layers: an always-visible headline row
     (path badge, name, status, one-line gist) and a collapsed Detail block."""
@@ -166,8 +194,13 @@ def render_component(comp, glossary, depth, path):
     if not name:
         sys.exit("component missing 'name': %r" % comp)
     status = comp.get("status", "planned")
+    if comp.get("details"):
+        sys.exit(
+            "component %r still has a 'details:' block. Detail belongs on a "
+            "deep-dive page; link it with 'deep_dive:' instead." % name
+        )
     summary = link_terms(render_inline(comp.get("summary", "")), glossary)
-    detail_html = link_terms(render_block(comp.get("details", "")), glossary)
+    deep = comp.get("deep_dive") or {}
     children = comp.get("children") or []
     children_html = "".join(
         render_component(c, glossary, depth + 1, "%s.%d" % (path, i))
@@ -183,15 +216,10 @@ def render_component(comp, glossary, depth, path):
     )
     if summary:
         head += '<div class="comp-gist">%s</div>' % summary
+    head += deep_dive_link(deep, name)
     head += "</div>"
 
     body = ""
-    if detail_html:
-        body += (
-            '<details class="detail"><summary>'
-            '<span class="layer-tag">Detail</span></summary>'
-            '<div class="detail-body">%s</div></details>' % detail_html
-        )
     if children_html:
         body += (
             '<div class="comp-children"><div class="parts-label">%d part%s</div>%s</div>'
@@ -349,27 +377,22 @@ ul { margin: .4em 0; padding-left: 1.3em; }
 .comp-body { padding-left: .1rem; }
 .comp-children { margin-top: .2rem; }
 .comp.lvl0 > .comp-body > .comp-children { margin-top: .9rem; }
-.parts-label, .layer-tag { font: 600 .66rem/1.5 "Source Sans 3", system-ui,
-  sans-serif; text-transform: uppercase; letter-spacing: .09em;
-  color: var(--muted); }
-.parts-label { margin-bottom: .1rem; }
+.parts-label { font: 600 .66rem/1.5 "Source Sans 3", system-ui, sans-serif;
+  text-transform: uppercase; letter-spacing: .09em; color: var(--muted);
+  margin-bottom: .1rem; }
 
-/* ---- the detail layer, visually inset and clearly second-class ---- */
-details.detail { margin: .5rem 0 .35rem; }
-details.detail > summary { cursor: pointer; list-style: none;
-  display: inline-block; }
-details.detail > summary::-webkit-details-marker { display: none; }
-.layer-tag { display: inline-block; border: 1px dashed var(--line);
-  border-radius: 999px; padding: .1em .6em; }
-.layer-tag::after { content: " ▸"; }
-details.detail[open] > summary .layer-tag { color: var(--accent);
-  border-style: solid; border-color: var(--accent); }
-details.detail[open] > summary .layer-tag::after { content: " ▾"; }
-.detail-body { margin-top: .4rem; padding: .6rem .85rem; background: var(--inset);
-  border-radius: 8px; font-size: .93em; }
-.detail-body > :first-child { margin-top: 0; }
-.detail-body > :last-child { margin-bottom: 0; }
-.detail-body code { background: var(--panel); }
+/* ---- the one way out of this page: a link to a deep-dive page ---- */
+.comp-deep { margin: .45rem 0 .1rem; }
+.deep-link { display: inline-block; border: 1px solid var(--line);
+  border-radius: 999px; padding: .12em .75em; text-decoration: none;
+  color: var(--accent); background: var(--inset);
+  font: 600 .72rem/1.6 "Source Sans 3", system-ui, sans-serif;
+  letter-spacing: .02em; }
+.deep-link:hover { border-color: var(--accent); background: var(--panel); }
+.deep-link:focus-visible { outline: 2px solid var(--accent);
+  outline-offset: 2px; }
+.deep-arrow { font-size: .9em; }
+.deep-pending { color: var(--muted); border-style: dashed; cursor: default; }
 .comp-ctl { display: flex; gap: .5rem; margin: 0 0 .2rem; }
 .comp-ctl button { font: 600 .72rem/1.6 "Source Sans 3", system-ui, sans-serif;
   color: var(--muted); background: var(--panel); border: 1px solid var(--line);
