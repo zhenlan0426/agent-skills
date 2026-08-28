@@ -5,13 +5,30 @@ One set of skills, shared by Claude Code and Codex, under git.
 ```
 ~/agent-skills/
   skills/<name>/SKILL.md     the only copy of anything
+  commands/<name>.md         Claude Code slash commands (see below)
   bin/sync.sh                converge tool dirs onto the repo
   bin/skill                  new | rm | ls | sync | save | doctor
   bin/install.sh             bootstrap / re-attach on a new machine
 
 ~/.claude/skills   ->  ~/agent-skills/skills        (whole dir, "mounted")
 ~/.codex/skills/<name> -> ~/agent-skills/skills/<name>   (per skill, "projected")
+~/.claude/commands/<name>.md -> ~/agent-skills/commands/<name>.md   (by hand)
 ```
+
+## Slash commands
+
+`~/.claude/commands/` cannot be mounted the way `~/.claude/skills` is: Claude
+Code also fills it with symlinks to skills' own `SKILL.md` files, so the
+directory has to stay real. Hand-written slash commands therefore live in
+`commands/` here and are symlinked in one file at a time:
+
+```sh
+mv ~/.claude/commands/<name>.md ~/agent-skills/commands/<name>.md
+ln -sfn ~/agent-skills/commands/<name>.md ~/.claude/commands/<name>.md
+```
+
+`sync.sh` does not manage these yet — a new machine needs the `ln` re-run by
+hand after `install.sh`.
 
 ## Why the two sides are attached differently
 
