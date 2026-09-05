@@ -1,6 +1,6 @@
 ---
 name: sysmap
-description: Maintain a human-facing living system map for the current project — a docs/system-map.yaml source (component tree with implementation status, plain-language glossary of agent-coined terms, "since you last read" changelog) rendered deterministically to HTML and published as an Artifact, plus one hand-authored free-format deep-dive page per top-level component, each its own Artifact linked from the map. Use when the user says /sysmap (init, update, render), asks to create or refresh the system map or glossary, says a feature landed and the map should be updated, or asks "what changed since I last looked". Also owns the hands-off two-agent review protocol (findings ledger between an implementer and a reviewer agent) — use when the user asks to run or set up such a review cycle.
+description: Maintain a human-facing living system map for the current project — a docs/system-map.yaml source (component tree with implementation status, plain-language glossary of agent-coined terms, "since you last read" changelog) rendered deterministically to HTML and published as an Artifact, plus one hand-authored free-format deep-dive page per implemented top-level component, each its own Artifact linked from the map. Use when the user says /sysmap (init, update, render), asks to create or refresh the system map or glossary, says a feature landed and the map should be updated, or asks "what changed since I last looked". Also owns the hands-off two-agent review protocol (findings ledger between an implementer and a reviewer agent) — use when the user asks to run or set up such a review cycle.
 ---
 
 # System Map
@@ -17,10 +17,12 @@ The map comes in two layers, and they are edited differently:
   tree with a status and one summary per node, changelog, glossary. It has to
   stay readable in two minutes.
 - **Deep-dive pages** — one hand-authored HTML page per top-level component
-  in `docs/sysmap/`, published as its own Artifact and linked from that
-  component's card. Free-format HTML, as visually rich as the subject needs,
-  no length limit; this is where all detail lives. The map's fixed structure
-  applies to the top-level page only.
+  that exists in code, in `docs/sysmap/`, published as its own Artifact and
+  linked from that component's card. Free-format HTML, as visually rich as
+  the subject needs, no length limit; this is where all detail lives. The
+  map's fixed structure applies to the top-level page only. A `planned`
+  component gets no deep-dive page and no link — its summary is the whole
+  story until the work starts.
   See [references/deep-dive-pages.md](references/deep-dive-pages.md).
 
 Three invariants:
@@ -51,10 +53,12 @@ Read it before writing any YAML.
    today.
 4. Write `docs/system-map.yaml`, render and publish (see below), then store
    the artifact URL in `meta.artifact_url`.
-5. Write one deep-dive page per top-level component and link it, following
-   [references/deep-dive-pages.md](references/deep-dive-pages.md). Publish
-   each, paste its URL into that component's `deep_dive.url`, then re-render
-   and republish the map.
+5. Write one deep-dive page per top-level component **that exists in code**
+   (`in-progress`, `implemented` or `validated`) and link it, following
+   [references/deep-dive-pages.md](references/deep-dive-pages.md). Skip
+   `planned` components entirely — no page, no `deep_dive` key. Publish
+   each page you wrote, paste its URL into that component's
+   `deep_dive.url`, then re-render and republish the map.
 6. Offer to append to the project's agent instructions file (CLAUDE.md or
    AGENTS.md — respect symlinks):
 
@@ -78,8 +82,11 @@ Read it before writing any YAML.
    summary to fit new detail.
 3. Reconcile the deep-dive pages the diff touched: edit the affected sections
    of `docs/sysmap/<slug>.html` directly — new measurements, dropped
-   approaches with the reason, changed contracts. A new top-level component
-   needs a new page. Republish each page you changed (pass its `url`).
+   approaches with the reason, changed contracts. A top-level component
+   needs a new page in the cycle where it stops being `planned` — that is
+   when there is finally something to detail. A component still `planned`
+   after this cycle gets no page. Republish each page you changed (pass its
+   `url`).
    **Touch nothing the diff does not reach**: do not rewrite, restyle, or
    "improve" unaffected summaries, glossary entries, or deep-dive pages —
    an update must leave everything else byte-identical, and an untouched

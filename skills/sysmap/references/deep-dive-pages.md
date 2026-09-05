@@ -1,9 +1,25 @@
 # Deep-dive pages
 
 The map is an index; the deep-dive pages are the documents behind it. One page
-per top-level component, hand-authored HTML, published as its own Artifact
-with its own stable URL, reached from the `deep_dive` link on that component's
-card.
+per top-level component **that exists in code**, hand-authored HTML, published
+as its own Artifact with its own stable URL, reached from the `deep_dive` link
+on that component's card.
+
+## Which components get one
+
+| Status | Deep-dive page |
+| --- | --- |
+| `planned` | **None.** No page, no `deep_dive` key, no link on the card. |
+| `in-progress` | Optional — write it once the shape has settled. |
+| `implemented` / `validated` | Yes. |
+| `abandoned` | Keeps the page it had, with the reason on it. If it never had one, the reason goes in the map's `summary` and that is enough. |
+
+A `planned` component has nothing to detail beyond its summary: no
+measurements, no contracts, no worked examples, only the intention already on
+the card. A page written for it would restate the summary, which is the one
+thing these pages must not do — and it would age into a description of
+something that was never built. Write the page in the cycle where the
+component stops being `planned`.
 
 Why the split: the map has to stay readable in two minutes, and detail has no
 natural size limit. Every time detail grew inside the map it pushed the
@@ -35,7 +51,8 @@ Rules that keep the two honest:
 
 ## Authoring one
 
-There is no template. Each page is free-format HTML, designed for its
+Only for a component that exists in code — see the table above. There is no
+template. Each page is free-format HTML, designed for its
 subject: a pipeline earns a diagram, a calibration story earns charts and a
 measurement table, a contract earns annotated examples. Be as visually rich
 as the subject deserves — and no richer. The fixed structure of the system

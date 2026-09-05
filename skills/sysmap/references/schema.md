@@ -2,8 +2,10 @@
 
 The data file is the single source of truth for the **high-level page**. Edit
 it; never hand-edit `system-map.html`. Detail does not live here at all — it
-lives in hand-authored deep-dive pages, one per top-level component, linked
-from the map (see [deep-dive-pages.md](deep-dive-pages.md)). Every field holding prose supports minimal markdown:
+lives in hand-authored deep-dive pages, one per top-level component that
+exists in code, linked from the map (see
+[deep-dive-pages.md](deep-dive-pages.md)). A `planned` component has no
+deep-dive page and no `deep_dive` key. Every field holding prose supports minimal markdown:
 paragraphs separated by blank lines, `- ` bullets, `` `code` ``, `**bold**`.
 
 Write all prose for the human owner: plain language, no unexplained jargon.
@@ -27,7 +29,8 @@ components:                       # L1 tree, drill-down via nesting
   - name: Detection
     status: validated             # planned | in-progress | implemented | validated | abandoned
     summary: One or two sentences. This is all the map shows for a node.
-    deep_dive:                    # optional; in practice on top-level components
+    deep_dive:                    # optional; top-level components that exist in
+                                  # code. OMIT on a `planned` component.
       file: docs/sysmap/detection.html      # the hand-authored page in this repo
       url: https://claude.ai/code/artifact/...  # its published Artifact (set after first publish)
       label: Deep dive            # optional link text, defaults to "Deep dive"
@@ -59,7 +62,7 @@ changelog:                        # NEWEST FIRST. Write each entry for someone
 
 | Status | Meaning |
 | --- | --- |
-| `planned` | Designed or agreed, no code yet |
+| `planned` | Designed or agreed, no code yet — no deep-dive page either |
 | `in-progress` | Being implemented right now |
 | `implemented` | Code exists and passed review |
 | `validated` | Measured / tested end-to-end and shown to work or help |
@@ -79,7 +82,9 @@ a rule. A card is open on load, deeper nodes start collapsed. An
 
 A `deep_dive` renders as a pill link under the summary — with a `url` it opens
 the published page in a new tab; with only a `file` it renders greyed as
-"not published yet", which is the reminder to publish it.
+"not published yet", which is the reminder to publish it. A node with no
+`deep_dive` renders no pill at all, which is the correct look for a `planned`
+component: status, name and summary, nothing to open yet.
 
 So `summary` must read as a standalone one-liner: it is the only prose the map
 carries for that node, and anything longer belongs on the deep-dive page.
