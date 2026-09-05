@@ -1,0 +1,7 @@
+interface:
+  display_name: "Docs Sync"
+  short_description: "Audit, archive, and sync project docs with the code"
+  default_prompt: "Use $docs-sync to audit and sync this project's documentation with recent code changes."
+
+policy:
+  allow_implicit_invocation: false

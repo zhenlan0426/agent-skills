@@ -1,10 +1,13 @@
 ---
 name: docs-sync
 description: >-
-  Audit and update project documentation (all .md files and CLAUDE.md) to stay in sync with recent code changes: archive docs whose design/plan/fix has landed and whose subsystem is settled, keep only living subsystems on a minimal top-level surface, keep the agent-facing routing surface (doc index, CLAUDE.md task map, scripts index) tight, enforce progressive disclosure structure, and reconcile the project's Claude Code memory notes against the current codebase. Use when the user asks to sync docs, check if docs are up-to-date, update documentation after code changes, audit docs freshness, review doc quality, archive landed design/plan/fix docs, trim or de-bloat CLAUDE.md, apply progressive disclosure to documentation, or clean up/verify project memory. Triggers include "sync docs", "update docs", "are my docs up to date", "docs audit", "check documentation", "archive docs", "trim CLAUDE.md", "progressive disclosure", "clean up memory", "memory cleanup", "/docs-sync".
+  Full documentation audit for this repo, run only on explicit request (/docs-sync in Claude Code, $docs-sync in Codex). Syncs every .md file and CLAUDE.md against code changes since the last Docs-Sync-Checkpoint commit, archives landed design/plan/fix docs, tightens the doc index and CLAUDE.md task map, enforces progressive disclosure, reconciles Claude Code project memory, and commits. Not for ordinary doc edits: do not invoke this when a task merely touches a README, adds a docstring, or asks to "update the docs" for one change — edit the file directly instead.
+disable-model-invocation: true
 ---
 
 # Docs Sync
+
+**Explicit invocation only.** This skill is a heavyweight, repo-wide operation that moves files into `docs/archived/`, rewrites CLAUDE.md, edits Claude Code memory, and commits. It runs only when the user invokes it by name (`/docs-sync` or `$docs-sync`). If you are reading this because it was auto-selected for a task that just mentions docs, stop: do not run the workflow, and handle the doc edit directly.
 
 Audit all markdown files and CLAUDE.md against recent code changes, then update them.
 
