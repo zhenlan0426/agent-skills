@@ -1,6 +1,7 @@
 ---
 name: sysmap
 description: Maintain a human-facing living system map for the current project — a docs/system-map.yaml source (component tree with implementation status, plain-language glossary of agent-coined terms, "since you last read" changelog) rendered deterministically to HTML and published as an Artifact, plus one hand-authored free-format deep-dive page per implemented top-level component, each its own Artifact linked from the map. Use when the user says /sysmap (init, update, render), asks to create or refresh the system map or glossary, says a feature landed and the map should be updated, or asks "what changed since I last looked". Also owns the hands-off two-agent review protocol (findings ledger between an implementer and a reviewer agent) — use when the user asks to run or set up such a review cycle.
+disable-model-invocation: true
 ---
 
 # System Map
