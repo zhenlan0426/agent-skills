@@ -2,6 +2,7 @@
 import json
 import math
 import re
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import httpx
@@ -26,9 +27,11 @@ def resolve_model(model, values):
             raise ValueError("Use an exact provider/model ID without whitespace")
         return model
     available = [s.strip() for s in (values.get("LLMS_AVAILABLE") or "").split(",") if s.strip()]
-    if model in available or not available:
+    if model in available:
         return model
-    matches = [s for s in available if _slug(s) == _slug(model)]
+    matches = [s for s in available if (
+        _slug(s) == _slug(model) or s.split("/", 1)[-1].split("@", 1)[0] == model
+    )]
     if len(matches) == 1:
         return matches[0]
     raise KaggleLLMError(f"Unknown model alias {model!r}. Run kaggle-llm models or provide the exact provider/model ID.")
@@ -44,6 +47,36 @@ def _endpoint(value):
     if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.query or parsed.fragment:
         raise KaggleLLMError("MODEL_PROXY_URL must be an HTTPS base URL without user info, query, or fragment.")
     return url + "/openapi/chat/completions"
+
+
+@dataclass(frozen=True)
+class _PreparedSchema:
+    schema: object
+    validator: object
+    encoded: str
+
+
+def _prepare_schema(schema):
+    if isinstance(schema, _PreparedSchema):
+        return schema
+    try:
+        validator_cls = jsonschema.validators.validator_for(schema)
+        validator_cls.check_schema(schema)
+    except (jsonschema.SchemaError, TypeError, AttributeError):
+        raise ValueError("Invalid JSON Schema") from None
+
+    # Keep validation offline: allow only same-document references.
+    def check_refs(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("$ref", "$dynamicRef") and isinstance(value, str) and not value.startswith("#"):
+                    raise ValueError("Only local JSON Schema references are supported")
+                check_refs(value)
+        elif isinstance(node, list):
+            for item in node:
+                check_refs(item)
+    check_refs(schema)
+    return _PreparedSchema(schema, validator_cls(schema), json.dumps(schema, allow_nan=False))
 
 
 class Client:
@@ -115,9 +148,10 @@ class Client:
                     429: "Quota or rate limit reached. Wait before trying again.",
                 }
                 hint = hints.get(response.status_code, "Proxy request failed; no automatic retry.")
-                raise KaggleLLMError(f"HTTP {response.status_code}: {hint}")
+                raise KaggleLLMError(f"HTTP {response.status_code}: {hint}",
+                                     batch_fatal=response.status_code in (401, 403, 429))
             try:
-                result = response.json()
+                result = loads(response.text)
             except ValueError:
                 raise KaggleLLMError("Proxy returned invalid JSON.") from None
             if not isinstance(result, dict) or not result.get("choices"):
@@ -138,26 +172,11 @@ class Client:
         if schema_mode not in ("prompt", "native"):
             raise ValueError("schema_mode must be prompt or native")
         if schema is not None:
-            try:
-                validator_cls = jsonschema.validators.validator_for(schema)
-                validator_cls.check_schema(schema)
-            except (jsonschema.SchemaError, TypeError, AttributeError):
-                raise ValueError("Invalid JSON Schema") from None
-            # Keep validation offline: allow only same-document references.
-            def check_refs(node):
-                if isinstance(node, dict):
-                    for key, value in node.items():
-                        if key in ("$ref", "$dynamicRef") and isinstance(value, str) and not value.startswith("#"):
-                            raise ValueError("Only local JSON Schema references are supported")
-                        check_refs(value)
-                elif isinstance(node, list):
-                    for item in node:
-                        check_refs(item)
-            check_refs(schema)
-            prompt += "\n\nReturn only valid JSON satisfying this schema (no markdown):\n" + json.dumps(schema, allow_nan=False)
+            prepared = _prepare_schema(schema)
+            prompt += "\n\nReturn only valid JSON satisfying this schema (no markdown):\n" + prepared.encoded
             if schema_mode == "native":
                 options["response_format"] = {"type": "json_schema", "json_schema": {
-                    "name": "result", "strict": True, "schema": schema,
+                    "name": "result", "strict": True, "schema": prepared.schema,
                 }}
         messages = ([{"role": "system", "content": system}] if system is not None else [])
         messages.append({"role": "user", "content": prompt})
@@ -171,13 +190,13 @@ class Client:
             if finish == "length":
                 raise KaggleLLMError("Output was truncated; increase max_tokens before retrying.")
             text = message.get("content")
+            # Some models include reasoning by default, even without an effort option.
+            if isinstance(text, str):
+                text = re.sub(r"^\s*<think>.*?</think>\s*", "", text, count=1, flags=re.S)
             if not isinstance(text, str) or not text.strip():
                 raise KaggleLLMError("Model returned no text content.")
         except (TypeError, KeyError, IndexError, AttributeError):
             raise KaggleLLMError("Malformed completion response.") from None
-        # Kaggle may embed reasoning in content when effort is requested.
-        if options.get("reasoning") not in (None, "none"):
-            text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.S).strip()
         structured = None
         if schema is not None:
             candidate = text.strip()
@@ -185,7 +204,7 @@ class Client:
                 candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate)
             try:
                 structured = loads(candidate)
-                validator_cls(schema).validate(structured)
+                prepared.validator.validate(structured)
             except (ValueError, jsonschema.ValidationError):
                 raise KaggleLLMError("Model output is invalid JSON or does not match the supplied schema.") from None
             except Exception:

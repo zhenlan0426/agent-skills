@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 from . import Client, KaggleLLMError
+from .client import _prepare_schema
 from .jsonutil import loads
 
 
@@ -39,6 +40,12 @@ def main(argv=None):
     batch.add_argument('input', help='JSONL path or - for stdin; rows contain prompt and optional id')
     _options(batch)
     args = parser.parse_args(argv)
+    schema = None
+    if getattr(args, 'schema', None) is not None:
+        try:
+            schema = _prepare_schema(loads(args.schema.read_text(encoding='utf-8')))
+        except (ValueError, OSError) as exc:
+            parser.error(f'Invalid --schema: {exc}')
     try:
         with Client(env_file=args.env_file, timeout=args.timeout) as client:
             if args.command in ('auth', 'models'):
@@ -46,12 +53,15 @@ def main(argv=None):
                 return 0
             options = {key: getattr(args, key) for key in (
                 'model', 'system', 'schema_mode', 'max_tokens', 'temperature', 'reasoning')}
-            options['schema'] = loads(args.schema.read_text()) if args.schema else None
+            options['schema'] = schema
             if args.command == 'prompt':
                 text = args.prompt if args.prompt is not None else (
                     args.file.read_text(encoding='utf-8') if args.file else sys.stdin.read())
                 result = client.prompt(text, **options)
-                print(result['text']) if args.text else emit(result)
+                if args.text:
+                    print(result['text'])
+                else:
+                    emit(result)
                 return 0
             failures = 0
             stream = sys.stdin if args.input == '-' else open(args.input, encoding='utf-8')
@@ -72,6 +82,9 @@ def main(argv=None):
                     except (KaggleLLMError, ValueError) as exc:
                         failures += 1
                         emit({'line': number, 'id': row_id, 'ok': False, 'error': str(exc)})
+                        if isinstance(exc, KaggleLLMError) and exc.batch_fatal:
+                            print('Batch stopped; remaining rows were not sent.', file=sys.stderr)
+                            break
             finally:
                 if stream is not sys.stdin:
                     stream.close()

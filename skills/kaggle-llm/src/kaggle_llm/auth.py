@@ -14,6 +14,10 @@ from dotenv import dotenv_values
 class KaggleLLMError(RuntimeError):
     """A safe-to-display failure; excludes credentials and upstream request bodies."""
 
+    def __init__(self, message, *, batch_fatal=False):
+        super().__init__(message)
+        self.batch_fatal = batch_fatal
+
 
 def default_env_file():
     return Path(os.environ.get("KAGGLE_LLM_ENV_FILE", "~/.config/kaggle-llm/credentials.env")).expanduser()
@@ -59,26 +63,27 @@ class Credentials:
             executable = Path(sys.executable).parent / "kaggle"
             command = str(executable) if executable.exists() else shutil.which("kaggle")
             if not command:
-                raise KaggleLLMError("Kaggle CLI is missing. Install kaggle>=2.2.2 and authenticate your Kaggle account.")
+                raise KaggleLLMError("Kaggle CLI is missing. Install kaggle>=2.2.2 and authenticate your Kaggle account.", batch_fatal=True)
             with tempfile.TemporaryDirectory(prefix="refresh-", dir=self.path.parent) as directory:
                 env = Path(directory) / "credentials.env"
                 try:
                     result = subprocess.run(
                         [command, "b", "init", "-y", "--env-file", str(env),
                          "--example-file", str(Path(directory) / "example.py")],
-                        cwd=directory, capture_output=True, text=True, timeout=90,
+                        cwd=directory, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90,
                     )
                 except (OSError, subprocess.TimeoutExpired):
-                    raise KaggleLLMError("Kaggle credential refresh failed or timed out; check Kaggle CLI connectivity.") from None
+                    raise KaggleLLMError("Kaggle credential refresh failed or timed out; check Kaggle CLI connectivity.", batch_fatal=True) from None
                 if result.returncode or not env.exists():
                     # CLI errors can include tokens or URLs: don't relay them verbatim.
                     raise KaggleLLMError(
                         "Kaggle credential refresh failed. Check your Kaggle login, account verification, "
-                        "and Benchmarks access. Diagnose with `kaggle b init -y` in a private temporary directory."
+                        "and Benchmarks access. Diagnose with `kaggle b init -y` in a private temporary directory.",
+                        batch_fatal=True,
                     )
                 values = dict(dotenv_values(env, interpolate=False))
                 if not self.valid(values):
-                    raise KaggleLLMError("Kaggle returned missing, expired, or malformed proxy credentials.")
+                    raise KaggleLLMError("Kaggle returned missing, expired, or malformed proxy credentials.", batch_fatal=True)
                 env.chmod(0o600)
                 os.replace(env, self.path)
                 return values
