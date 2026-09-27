@@ -82,7 +82,7 @@ tests/test_remote.py       # executable contract
 
 ### 3.3 `client.py` refactor (no behavior change for local calls)
 
-- `build_request(prompt, *, system=None, schema=None, schema_mode="prompt", max_tokens=None, temperature=None, reasoning=None) -> (messages, options, prepared)`
+- `build_request(prompt, *, system=None, schema=None, schema_mode="native", max_tokens=None, temperature=None, reasoning=None) -> (messages, options, prepared)`
   - `messages`: the exact list `Client.prompt` sends. The schema instruction is
     appended to the prompt exactly as today.
   - `options`: Chat Completions **payload** keys, including only those set:
@@ -211,7 +211,7 @@ class JobStore:
     def save_state(self, job_id, state) -> None               # atomic write
     def list(self) -> list[dict]
 
-def prepare_job(rows, *, catalog, system=None, schema=None, schema_mode="prompt",
+def prepare_job(rows, *, catalog, system=None, schema=None, schema_mode="native",
                 model=None, max_tokens=16000, temperature=None, reasoning=None,
                 concurrency=8, max_attempts=4, max_cost_usd=10.0,
                 deadline_seconds=DEFAULT_DEADLINE, dedup=False, threshold=0.85,

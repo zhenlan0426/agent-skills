@@ -1,43 +1,35 @@
 ---
 name: agy
 description: >-
-  Get programmatic, API-style LLM access for a repeated job whose per-item work needs
-  semantic understanding — classifying, extracting, parsing, summarizing, labelling,
-  or judging many files, rows, documents, or records, and any LLM call embedded in a
-  script, pipeline, or cron job. Reach for this INSTEAD of doing the semantic work
-  turn-by-turn inside the coding agent: it runs on a separate, largely unused
-  high-quota account, while Claude Code and Codex quota is reserved for coding.
-  Triggers include looping over many inputs that each need a language judgment,
-  writing a script that has to call an LLM, one-shot headless prompts, structured
-  JSON output against a schema, unattended or batch runs, and any request to "use
-  Gemini", "use agy", or "run it headlessly".
+  Fallback for programmatic, API-style LLM access through the Antigravity CLI (Gemini)
+  on a separate high-quota account. Use when the user asks for Gemini or agy ("use
+  Gemini", "use agy", "run it headlessly"), when a kaggle-llm batch stops on quota
+  (HTTP 403 or 429), or for a very large repeated LLM job where Kaggle Model Proxy
+  spend matters. Otherwise the kaggle-llm skill is the default for scripted,
+  batch, or schema-constrained LLM calls.
 ---
 
-# agy — programmatic LLM access for batch semantic work
+# agy — fallback LLM access for batch semantic work
 
 `agy` (`~/.local/bin/agy`) is the **Antigravity CLI** — not the Antigravity
 desktop app. It is installed and logged in.
 
 ## When to reach for it
 
-The signal is **a repeated job that needs language understanding per item**, with
-no human in the loop: N documents to extract fields from, N rows to classify, N
-files to summarize, a script that needs one LLM call per record.
+`kaggle-llm` is the default backend for scripted LLM work: it scored higher and ran
+faster on the eval set (`../kaggle-llm/eval/`), and its routing rules are in its
+SKILL.md. Use agy instead when:
 
-Treat it as an **API you can shell out to**, and prefer it over doing the same
-work yourself in-session:
+- **The user asks for Gemini or agy**, or an existing script already uses it.
+- **Kaggle quota runs out.** A kaggle-llm batch stops on 403 or 429; send the
+  unfinished rows here rather than retrying Kaggle.
+- **The job is very large.** Kaggle spend comes from a proxy quota that cannot be
+  queried (about $0.01 per item on the eval); this account has high quota and is
+  not used for anything else.
 
-- **Quota.** This account has high quota and is not used for anything else.
-  Claude Code and Codex quota is spent on coding agents and may be tight — do not
-  burn it on bulk semantic labor a cheaper endpoint can do.
-- **Determinism.** A scripted loop with a fixed prompt and a JSON schema is
-  reproducible and re-runnable; the same work done conversationally is not.
-- **Scale.** Per-item calls stay flat in cost as N grows, instead of dragging
-  every item through one long context.
-
-So when the task is "go through all of these and decide something about each
-one," write the loop and call `agy` from it, rather than reading them all in and
-answering item by item.
+The same principle holds for either backend: when the task is "go through all of
+these and decide something about each one," write the loop and call the LLM from
+it, rather than reading every item into the coding agent's context.
 
 Not for this: interactive back-and-forth, work needing repo context or tool use,
 or anything where you'd otherwise make one or two calls total.
@@ -52,11 +44,14 @@ Never leave `--model` unset; the built-in default is not this one.
 
 - Reasoning effort is **baked into the model id** (`-high`), so `--effort` is
   redundant and should be omitted.
-- Pick the **highest version number**, not the "Pro" tier. `gemini-3.1-pro-high`
-  is an older version and zhenlan judges it worse than 3.7 Flash — Pro is not an
+- Use the **newest Flash version that passes the eval set** (18/18, see
+  `../kaggle-llm/eval/README.md`), not the "Pro" tier. `gemini-3.1-pro-high` is
+  an older version and zhenlan judges it worse than 3.7 Flash — Pro is not an
   upgrade path.
-- Run `agy models` when a newer Gemini may have shipped and move to it. As of
-  2026-08-30 the newest was `gemini-3.7-flash-high`.
+- When `agy models` lists a newer Gemini, run the eval on it before switching.
+  As of 2026-09-27, `gemini-3.8-flash-high` is newer but failed (empty output on
+  a code-writing task, 3 of 3 times) and was about 2x slower, so the default
+  stays `gemini-3.7-flash-high`.
 
 ## Structured output — the usual shape for batch work
 

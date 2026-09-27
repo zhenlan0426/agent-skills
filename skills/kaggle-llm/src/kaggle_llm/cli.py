@@ -23,7 +23,7 @@ def _options(parser):
                         'default: the model chosen by `kaggle-llm best`')
     parser.add_argument('--system')
     parser.add_argument('--schema', type=Path, help='JSON Schema file; validated locally')
-    parser.add_argument('--schema-mode', choices=['prompt', 'native'], default='prompt')
+    parser.add_argument('--schema-mode', choices=['prompt', 'native'], default='native')
     parser.add_argument('--max-tokens', type=int, help=f'Omitted by default locally; --remote default '
                         f'{remote.DEFAULT_MAX_TOKENS}')
     parser.add_argument('--temperature', type=float, help='Omitted by default; support varies by model')

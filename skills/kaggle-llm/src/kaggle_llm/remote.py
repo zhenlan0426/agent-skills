@@ -64,7 +64,7 @@ class RunInfo(NamedTuple):
     state: str               # "pending" | "completed" | "errored"
 
 
-def prepare_job(rows, *, catalog, system=None, schema=None, schema_mode="prompt",
+def prepare_job(rows, *, catalog, system=None, schema=None, schema_mode="native",
                 model=None, max_tokens=DEFAULT_MAX_TOKENS, temperature=None, reasoning=None,
                 concurrency=DEFAULT_CONCURRENCY, max_attempts=4, max_cost_usd=DEFAULT_MAX_COST_USD,
                 deadline_seconds=DEFAULT_DEADLINE, dedup=False, threshold=0.85,

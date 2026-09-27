@@ -474,7 +474,7 @@ class PrepareJobTests(unittest.TestCase):
         self.assertEqual({k: dropped[0][k] for k in ('line', 'id', 'duplicate_of_line')},
                          {'line': 2, 'id': 'b', 'duplicate_of_line': 1})
         self.assertAlmostEqual(dropped[0]['similarity'], 1.0)
-        self.assertEqual(spec['local'], {'schema': None, 'schema_mode': 'prompt'})
+        self.assertEqual(spec['local'], {'schema': None, 'schema_mode': 'native'})
         self.assertEqual((spec['version'], spec['execute_in'], spec['concurrency'], spec['max_attempts']),
                          (1, 'creation', 8, 4))
         self.assertIsNone(spec['dry_run'])

@@ -1,6 +1,17 @@
 ---
 name: kaggle-llm
-description: Call LLMs through the Kaggle Benchmarks Model Proxy from Python, a CLI, or JSONL batches, locally or as a remote batch on Kaggle's full model catalog. Use when the user requests Kaggle-backed API-style inference, structured extraction, a script using Kaggle model access, or Kaggle top-model batch generation such as fine-tuning data. Not for authoring or publishing benchmark tasks, GPU notebooks, or generic batch work where another provider was chosen.
+description: >-
+  Default for programmatic, API-style LLM access: any repeated job whose per-item work
+  needs semantic understanding (classifying, extracting, parsing, summarizing,
+  labelling, judging, solving many files, rows, documents, or records), any LLM call
+  embedded in a script, pipeline, or cron job, one-shot headless prompts, and
+  structured JSON output against a schema. Reach for it INSTEAD of doing that work
+  turn-by-turn inside the coding agent, whose quota is reserved for coding. Calls
+  Claude/GPT models through the Kaggle Benchmarks Model Proxy from Python, a CLI, or
+  JSONL batches, locally or as a remote batch on Kaggle's full model catalog (e.g.
+  fine-tuning data). Falls back to the agy skill when Kaggle quota runs out or the
+  user asks for Gemini. Not for authoring or publishing benchmark tasks or GPU
+  notebooks.
 ---
 
 # Kaggle LLM
@@ -8,6 +19,20 @@ description: Call LLMs through the Kaggle Benchmarks Model Proxy from Python, a 
 Use the installed `kaggle-llm` command or bundled `kaggle_llm.Client` Python package. This wraps the same local Model Proxy used by the official [write-kaggle-benchmarks skill](https://github.com/Kaggle/kaggle-skills/blob/main/write-kaggle-benchmarks/SKILL.md). Local calls create no benchmark task or notebook; only the opt-in `batch --remote` does (see below).
 
 Requires Unix (Linux/macOS); credential locking uses `fcntl`, so Windows is not supported.
+
+## Choosing a backend
+
+1. **Local `kaggle-llm` (default).** Current pick `anthropic/claude-sonnet-5@default`:
+   18/18 on the [eval set](eval/README.md), about 5 s and $0.011 per item.
+2. **`batch --remote`** only when the job needs a catalog model local access cannot
+   reach (Opus 5, GPT-6 Astra, open-weight models) and the user has agreed to the
+   permanent storage described below. About 1000 prompts per job, one job at a time.
+3. **agy** (the `agy` skill, Gemini) as the fallback: when a local batch stops on
+   403 or 429 (quota), for very large jobs where Kaggle spend matters (the Model
+   Proxy quota cannot be queried; 10,000 items is roughly $100 of it), or when the
+   user asks for Gemini or agy.
+
+Before changing the default backend or model, run the eval set on the candidate.
 
 ## Quick use
 
@@ -44,10 +69,10 @@ Local tokens reach only a small curated model set. `kaggle-llm batch input.jsonl
 - First use bootstraps from the existing Kaggle login. Credentials live outside projects at `~/.config/kaggle-llm/credentials.env` (0600); refresh uses isolated temporary files and a process lock. `kaggle-llm auth` forces refresh. Do not print or commit this file.
 - Calls consume the account's Model Proxy inference quota. Local access depends on the account and current Kaggle catalog. No unlimited-access or production-service guarantee is implied.
 - Expired tokens refresh proactively; a 401 refreshes once. Custom credential files are also replaced on refresh; see the API reference before using `--env-file`. 403, 429, server errors, and timeouts are surfaced without retries. A timeout may still have consumed quota. Stop dispatching additional batches after quota exhaustion.
-- `--schema` defaults to prompting for JSON and validating locally. `--schema-mode native` also requests native enforcement where supported. Validation failure and truncation are errors. JSON Schema format annotations are not enforced.
+- `--schema` requests JSON in the prompt, sends the schema as a native `response_format` (`--schema-mode native`, the default), and validates locally. Native mode lets the model reason before answering; with `--schema-mode prompt`, models tend to write their working and then the JSON, which fails validation (8 of 10 math rows in the eval). Use prompt mode only for a model or schema shape the native format rejects. Validation failure and truncation are errors. JSON Schema format annotations are not enforced.
 - Temperature, reasoning, and output-token parameters are sent only when requested. Tool execution, streaming, multimodal input, and an HTTP server are outside this wrapper's interface. `Client.chat` accepts explicit text history; `Client.prompt` has no persistent history.
-- Respect the requested provider. Use Kaggle-backed inference when requested; preserve the provider chosen for unrelated bulk semantic work.
+- Respect an explicitly requested provider: if the user or an existing script chose agy or another endpoint, keep it.
 
 ## Maintenance
 
-Source is in `src/kaggle_llm/`; CLI and Python API share one client. From this skill directory run `PYTHONPATH=src python3 -m unittest discover -s tests -v` after changes. These tests need the Python dependencies but no Kaggle executable, credentials, or live inference. Keep integration smoke tests small and report whether they actually ran.
+Source is in `src/kaggle_llm/`; CLI and Python API share one client. From this skill directory run `PYTHONPATH=src python3 -m unittest discover -s tests -v` after changes. These tests need the Python dependencies but no Kaggle executable, credentials, or live inference. Keep integration smoke tests small and report whether they actually ran. `eval/` holds the backend eval set (live calls, about $0.20 per run).

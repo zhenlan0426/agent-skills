@@ -108,6 +108,16 @@ class ClientTests(unittest.TestCase):
             c.prompt('count', schema={'$ref': 'https://example.com/schema'})
         self.assertEqual(len(self.requests), 1)
 
+    def test_schema_defaults_to_native_and_prompt_mode_opts_out(self):
+        c = self.client(lambda r: completion('4'))
+        c.prompt('count', schema={'type': 'integer'})
+        c.prompt('count', schema={'type': 'integer'}, schema_mode='prompt')
+        c.prompt('count')
+        sent = [json.loads(r.content) for r in self.requests]
+        self.assertEqual(sent[0]['response_format']['json_schema']['schema'], {'type': 'integer'})
+        self.assertNotIn('response_format', sent[1])
+        self.assertNotIn('response_format', sent[2])
+
     def test_nonfinite_json_is_rejected(self):
         c = self.client(lambda r: completion('NaN'))
         with self.assertRaisesRegex(KaggleLLMError, 'invalid JSON'):

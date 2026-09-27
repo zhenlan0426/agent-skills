@@ -178,12 +178,12 @@ class Client:
                 raise KaggleLLMError("Proxy returned no completion choices.")
             return result
 
-    def prompt(self, prompt, *, system=None, schema=None, schema_mode="prompt", model=None,
+    def prompt(self, prompt, *, system=None, schema=None, schema_mode="native", model=None,
                max_tokens=None, temperature=None, reasoning=None, **options):
         """Return text, structured_output, model, usage and finish_reason.
 
-        schema_mode='prompt' requests JSON in the prompt and validates locally.
-        'native' additionally sends response_format=json_schema (model dependent).
+        Both schema modes request JSON in the prompt and validate locally; 'native'
+        (the default) also sends response_format=json_schema (model dependent).
         Invalid/truncated output raises; it is never silently accepted or retried.
         """
         messages, payload, prepared = build_request(
@@ -206,7 +206,7 @@ def _check_options(max_tokens, temperature, reasoning):
         raise ValueError("Unsupported reasoning effort")
 
 
-def build_request(prompt, *, system=None, schema=None, schema_mode="prompt", max_tokens=None,
+def build_request(prompt, *, system=None, schema=None, schema_mode="native", max_tokens=None,
                   temperature=None, reasoning=None):
     """Return (messages, payload options, prepared schema or None) exactly as Client.prompt sends them."""
     if not isinstance(prompt, str) or not prompt:
