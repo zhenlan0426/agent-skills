@@ -112,7 +112,7 @@ Offline regressions cover an incompressible archive near the new cap, byte-for-b
 extraction, a real oversized archive, UTF-8 command growth, source-size checks at
 submit, the exact source boundary, and diagnostics retained after failed requests.
 Larger projects must use the private-dataset/bootstrap path in
-[data and runtime](data-and-runtime.md). Dataset transport was not live-tested here.
+[data and runtime](kaggle-data-and-runtime.md). Dataset transport was not live-tested here.
 
 ## Upstream references
 

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Kaggle GPU"
-  short_description: "Run local GPU batch jobs on private Kaggle kernels"
-  default_prompt: "Use $kaggle-gpu to run this project on a Kaggle GPU and retrieve the results."

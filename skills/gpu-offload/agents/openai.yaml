@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPU Offload"
+  short_description: "Route GPU jobs between the local 4090, Kaggle, and Colab"
+  default_prompt: "Use $gpu-offload to decide where this GPU job should run and run it there."

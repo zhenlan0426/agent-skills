@@ -17,7 +17,7 @@ import zipfile
 EXCLUDED = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.pytest_cache',
             '.mypy_cache', '.ipynb_checkpoints', '.kaggle', '.ssh', '.aws', '.cache',
             '.env', '.envrc', '.netrc', 'kaggle.json', 'access_token', 'credentials.json'}
-# Live transport validation and failure evidence: references/cli-notes.md.
+# Live transport validation and failure evidence: references/kaggle-cli-notes.md.
 COMPRESSED_LIMIT = 512 * 1024
 SOURCE_LIMIT = 704 * 1024
 UNPACKED_LIMIT = 20 * 1024 * 1024
@@ -96,7 +96,7 @@ def bundle(project, excludes):
     if len(data) > COMPRESSED_LIMIT:
         raise ValueError(f'Compressed project is {len(data):,} bytes; embedded limit is '
                          f'{COMPRESSED_LIMIT:,} bytes. Exclude large files or use a private '
-                         'dataset with a small bootstrap (references/data-and-runtime.md).')
+                         'dataset with a small bootstrap (references/kaggle-data-and-runtime.md).')
     return base64.b64encode(data).decode(), manifest
 
 
@@ -106,7 +106,7 @@ def check_source_size(source):
         raise ValueError(f'Kernel source is {size:,} bytes; tested embedded limit is '
                          f'{SOURCE_LIMIT:,} bytes including base64, wrapper, and command. '
                          'Reduce the embedded project/command or use a private dataset '
-                         '(references/data-and-runtime.md). No submission attempted.')
+                         '(references/kaggle-data-and-runtime.md). No submission attempted.')
     return size
 
 

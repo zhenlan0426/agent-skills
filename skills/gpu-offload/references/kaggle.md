@@ -1,18 +1,8 @@
----
-name: kaggle-gpu
-description: >-
-  Run local projects as private GPU batch jobs on Kaggle kernels using the
-  bundled kgpu helper: package code, attach data, submit, monitor, and retrieve
-  results. Use when the user asks to offload work to Kaggle or use Kaggle GPU
-  compute. For notebook discovery, conversion, or historical source retrieval,
-  use the corresponding notebook skills instead.
----
-
 # Kaggle GPU batch jobs
 
-Use `scripts/kgpu` relative to this skill directory (called `kgpu` below).
-The local RTX 4090 remains the default unless the task calls for Kaggle.
-Kaggle runs a submitted script in a fresh environment; there is no persistent
+The helper is `~/agent-skills/skills/gpu-offload/scripts/kgpu` (called `kgpu`
+below). When to use Kaggle, and the fact that it needs no permission, are
+covered in [../SKILL.md](../SKILL.md). Kaggle runs a submitted script in a fresh environment; there is no persistent
 shell, incremental file push, or Colab-style `up`/`down` in this workflow.
 
 ## Before submitting
@@ -24,18 +14,20 @@ shell, incremental file push, or Colab-style `up`/`down` in this workflow.
   locally; existing API-token or legacy `kaggle.json` configuration also works.
   Never print credentials or copy local auth files into a kernel.
 - Establish the project, command, data sources, intended outputs, and maximum
-  run time. Use an existing authorized scope; ask only for consequential missing
-  choices. Creating this skill alone does not authorize uploading a real project.
-- Choose the accelerator with the user when unspecified. `NvidiaTeslaT4` is
-  the documented default GPU shape (T4 ×2); it is not a combined 32 GB GPU and
-  code must explicitly use multiple devices. Other accelerator names and quotas
-  depend on account/competition eligibility. Don't promise an A100/H100 or hardcode
+  run time. Kernels are private, so uploading the project needs no separate
+  permission; the manifest review below still applies.
+- Use `NvidiaTeslaT4` (T4 ×2) unless the user or a competition calls for
+  another shape. It is not a combined 32 GB GPU: code must explicitly use both
+  devices, and data parallelism alone doesn't add model capacity. Some
+  competitions allow larger accelerators, so check the competition's code
+  requirements when working on one. Other accelerator names and quotas depend
+  on account/competition eligibility. Don't promise an A100/H100 or hardcode
   weekly allowances. Check the account UI for remaining quota (`kaggle quota`
   crashes in CLI 2.2.2). If allocation fails, report it before switching
   hardware or resubmitting.
 - Kernel code and outputs are private by default. Review the local file manifest
   before upload. Secrets belong in Kaggle Secrets, not source, argv, or datasets.
-  Read [references/data-and-runtime.md](references/data-and-runtime.md) when
+  Read [kaggle-data-and-runtime.md](kaggle-data-and-runtime.md) when
   handling large local inputs, dependencies, secrets, or checkpoint recovery.
 
 ## Workflow
@@ -63,10 +55,10 @@ compressed**, **20 MiB unpacked**, and the final UTF-8 kernel script at **704 Ki
 (base64, wrapper, and command included). Preparation reports archive/script sizes
 and records them in `job.json`; submission rechecks the actual script, including
 older prepared jobs. These are local guardrails backed by the
-[live validation record](references/cli-notes.md), not Kaggle's published limits:
+[live validation record](kaggle-cli-notes.md), not Kaggle's published limits:
 a near-2 MiB bundle in a 2,800,000-byte script was rejected by the API.
 Use a private dataset and small bootstrap for larger projects, as described in
-[data and runtime](references/data-and-runtime.md). A project may contain notebooks, but
+[data and runtime](kaggle-data-and-runtime.md). A project may contain notebooks, but
 the command must be an executable batch entrypoint; a notebook is not executed
 just because it is bundled.
 
@@ -101,9 +93,9 @@ probe fails a GPU job instead of silently continuing on CPU.
 
 ## Failure and recovery
 
-Don't automatically rerun failed jobs or launch a sweep: each submission uses
-quota. Fix and resubmit within an already authorized retry/experiment budget;
-otherwise explain the cause and ask before spending more quota. For 401/403,
+Kaggle quota is free and resets weekly, so fixing a failure and resubmitting
+needs no permission. Don't resubmit unchanged after a failure you haven't
+diagnosed, and don't launch sweeps or extra runs the task didn't call for. For 401/403,
 check auth, ownership, data access, and competition-rule acceptance. For GPU
 eligibility, quota, or verification errors, report the actual server message.
 Do not work around account limits.
@@ -115,5 +107,5 @@ arrange authorized external checkpoint uploads or divide work into completed
 versions that consume prior outputs. Do not claim live file downloads or
 checkpoint recovery have been verified when only final output retrieval was.
 
-See [references/cli-notes.md](references/cli-notes.md) for upstream sources,
+See [kaggle-cli-notes.md](kaggle-cli-notes.md) for upstream sources,
 version-specific caveats, and the validation record.

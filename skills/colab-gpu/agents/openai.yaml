@@ -1,7 +1,0 @@
-interface:
-  display_name: "Colab GPU"
-  short_description: "Offload a GPU job to Google Colab (spends compute units)"
-  default_prompt: "Use $colab-gpu to run this job on a Colab GPU."
-
-policy:
-  allow_implicit_invocation: false

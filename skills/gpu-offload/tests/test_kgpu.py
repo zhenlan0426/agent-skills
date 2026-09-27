@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-kg = SimpleNamespace(**runpy.run_path(str(Path(__file__).with_name('kgpu'))))
+kg = SimpleNamespace(**runpy.run_path(str(Path(__file__).resolve().parent.parent / 'scripts' / 'kgpu')))
 G = kg.prepare.__globals__
 
 

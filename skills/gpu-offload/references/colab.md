@@ -1,16 +1,10 @@
----
-name: colab-gpu
-description: >-
-  Offload a GPU job from this machine to Google Colab (the user's Colab Pro account) using the official `colab` CLI and the bundled `cgpu` helper — allocate a T4/L4/G4/A100/H100, push code and data, run a long job detached, poll logs, pull results, stop the VM. Explicit invocation only (/colab-gpu, $colab-gpu, or the user saying to run something on Colab): it spends paid compute units. Do not use it just because a task involves a GPU; the local RTX 4090 is the default.
-disable-model-invocation: true
----
-
 # Colab GPU offload
 
-Runs work on a rented Colab VM. **Only when the user asked for Colab.** Every
+Runs work on a rented Colab VM. Use it only when the user asked for Colab or
+you wrote the justification that [../SKILL.md](../SKILL.md) requires. Every
 minute a VM is allocated burns compute units, so finish with `cgpu down`.
 
-The helper is `~/agent-skills/skills/colab-gpu/scripts/cgpu` (call it `cgpu`
+The helper is `~/agent-skills/skills/gpu-offload/scripts/cgpu` (call it `cgpu`
 below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
 `colab help <cmd>` covers the raw CLI.
 
@@ -23,9 +17,9 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
   colab-cli 0.7.4 and depends on its exact messages. If `colab` isn't installed,
   run `uv tool install google-colab-cli==0.7.4`. If `colab version` reports a
   different version, tell the user: the workarounds below may no longer hold.
-- **Pick the GPU with the user** unless they named one or delegated the choice
-  (for example "whatever fits under N units/hour"). Measured on this account
-  (Colab Pro, 2026-09-27; rates in compute units per hour):
+- **GPU:** use the one the user named. Otherwise use G4 (see the routing
+  table in [../SKILL.md](../SKILL.md)). Measured on this account (Colab Pro,
+  2026-09-27; rates in compute units per hour):
 
   | `--gpu` | GPU | VRAM | vCPU / RAM | CU/hr |
   |---|---|---|---|---|
@@ -35,13 +29,16 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
   | G4 | RTX PRO 6000 Blackwell | 96GB | 48 / 185GB | 8.90 |
   | H100 | — | — | rejected: no entitlement on Pro | — |
 
-  The local 4090 has 24GB. T4 and L4 are slower than the 4090 and only make
-  sense for parallel work. For more VRAM or speed, choose G4 or A100. `cgpu up`
-  prints the actual GPU and the current rate. Tell the user the rate.
+  The local 4090 has 24GB. T4 and L4 are slower than the 4090, and Kaggle's
+  free T4 ×2 covers the same need. G4 gives more VRAM per CU than A100 and a
+  newer architecture. `cgpu up` prints the actual GPU and the current rate.
+  Include the rate in your justification.
 - Plain `--gpu A100` returned 503 while `A100 --high-mem` allocated. The first
   exec on that A100 then hung without starting. If `up` fails or hangs, run
-  `cgpu down` and **ask before switching to another type**, unless the user
-  already said what to fall back to. `cgpu up` already refuses unknown GPU
+  `cgpu down`. Switch to another type only if the justification still holds
+  for that card (for example, the job fits the A100's VRAM, which
+  `nvidia-smi` shows). Say that you switched and why, unless the user already
+  said what to fall back to. `cgpu up` already refuses unknown GPU
   names, because the raw CLI silently turns them into an A100.
 - Billing looks like it has a minimum per allocation. Four sub-minute probes
   plus one ~7-minute A100 cost 4.87 CU, which matches ~15 minutes billed for
@@ -138,9 +135,10 @@ cgpu down job1                                 # always, once results are safe (
   (keeps the VM). A job cut off that way never writes an exit status: after
   about 3 minutes `logs` reports it LOST and `wait` exits 3. Its process may
   still be running, so `start` refuses until `cgpu kill` has been sent.
-- If the session is gone, recreate it with `cgpu up` and resume from the last
-  off-VM checkpoint, but **only with the user's authorization**, which they may
-  have given up front (for example "retry once if the VM dies"). A rerun spends
+- If the session is gone, you may recreate it with `cgpu up` once and resume
+  from the last off-VM checkpoint. First tell the user what was lost and what
+  resuming will cost. If there is no off-VM checkpoint, the session is lost a
+  second time, or the user said not to retry, stop and ask. A rerun spends
   compute units again.
 - If `pull` fails, don't `down` yet: that would destroy the only copy. Check
   that the session is still alive (`cgpu ls`), then retry. Pull a directory
@@ -154,7 +152,7 @@ cgpu down job1                                 # always, once results are safe (
 
 ## Changing `cgpu`
 
-`python3 -m pytest ~/agent-skills/skills/colab-gpu/tests -q` runs offline
+`python3 -m pytest ~/agent-skills/skills/gpu-offload/tests/test_cgpu.py -q` runs offline
 against a fake `colab` (`tests/fake_colab.py`) that reproduces the failure paths
 above: a busy kernel, a reused name, directory and interrupted pulls, oversized
 logs, a kernel restart. It can't prove the real service still behaves that way,

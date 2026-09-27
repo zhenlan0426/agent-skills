@@ -1,6 +1,6 @@
 """Offline regression tests for cgpu, run against tests/fake_colab.py.
 
-    python3 -m pytest ~/agent-skills/skills/colab-gpu/tests -q
+    python3 -m pytest ~/agent-skills/skills/gpu-offload/tests -q
 
 These cover failure paths a real VM rarely shows on demand. The happy path is
 still worth checking on a real T4 after changing cgpu.
