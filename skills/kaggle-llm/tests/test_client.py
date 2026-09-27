@@ -59,8 +59,12 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.requests[0].headers['Authorization'], 'Bearer secret-test-token')
 
     def test_unknown_model_rejected_before_inference(self):
-        with self.assertRaises(KaggleLLMError):
-            self.client(lambda r: completion()).prompt('hello', model='unavailable')
+        self.path.write_text(ENV.replace('2099-', '2000-'))
+        c = self.client(lambda r: completion())
+        with patch.object(c.credentials, 'ensure') as ensure, self.assertRaises(KaggleLLMError) as caught:
+            c.prompt('hello', model='unavailable')
+        ensure.assert_not_called()
+        self.assertTrue(caught.exception.batch_fatal)
         self.assertFalse(self.requests)
 
     def test_unlisted_exact_model_is_sent_unchanged(self):
@@ -81,8 +85,10 @@ class ClientTests(unittest.TestCase):
 
     def test_json_schema_validation(self):
         schema = {'type': 'object', 'properties': {'n': {'type': 'integer'}}, 'required': ['n']}
-        c = self.client(lambda r: completion('```json\n{"n": 4}\n```'))
-        self.assertEqual(c.prompt('count', schema=schema)['structured_output'], {'n': 4})
+        for tag in ('json', 'JSON', 'Json', ''):
+            with self.subTest(tag=tag):
+                c = self.client(lambda r: completion(f'```{tag}\n{{"n": 4}}\n```'))
+                self.assertEqual(c.prompt('count', schema=schema)['structured_output'], {'n': 4})
         c = self.client(lambda r: completion('{"n": "wrong type"}'))
         with self.assertRaisesRegex(KaggleLLMError, 'schema'):
             c.prompt('count', schema=schema)
@@ -155,7 +161,8 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(kwargs['stdin'], subprocess.DEVNULL)
             Path(command[command.index('--env-file') + 1]).write_text(ENV)
             return subprocess.CompletedProcess(command, 0)
-        with patch('kaggle_llm.auth.subprocess.run', side_effect=init) as run:
+        with patch('kaggle_llm.auth.shutil.which', return_value='/mock/bin/kaggle'), \
+                patch('kaggle_llm.auth.subprocess.run', side_effect=init) as run:
             credentials = Credentials(self.path)
             credentials.ensure()
             credentials.ensure()
@@ -195,7 +202,7 @@ class ClientTests(unittest.TestCase):
         return code, [json.loads(line) for line in out.getvalue().splitlines()], err.getvalue()
 
     def test_batch_stops_on_access_quota_and_persistent_401(self):
-        for status, count in [(403, 1), (429, 1), (401, 2)]:
+        for status, count in [(403, 1), (404, 1), (429, 1), (401, 2)]:
             with self.subTest(status=status):
                 self.requests.clear()
                 c = self.client(lambda r: httpx.Response(status))
@@ -223,7 +230,8 @@ class ClientTests(unittest.TestCase):
                         if failure == 'malformed':
                             Path(command[command.index('--env-file') + 1]).write_text('')
                         return subprocess.CompletedProcess(command, int(failure == 'login'))
-                    with patch('kaggle_llm.auth.subprocess.run', side_effect=init) as run:
+                    with patch('kaggle_llm.auth.shutil.which', return_value='/mock/bin/kaggle'), \
+                            patch('kaggle_llm.auth.subprocess.run', side_effect=init) as run:
                         code, rows, _ = self.run_batch(c)
                     self.assertEqual(code, 1)
                     self.assertEqual(len(rows), 1)
@@ -237,6 +245,79 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual([row['ok'] for row in rows], [False, True, True, True, True])
         self.assertEqual(len(self.requests), 5)
+
+    def test_batch_stops_on_invalid_local_configuration(self):
+        for env, model in (
+            (ENV, 'unknown'), (ENV, 'bad/model/id'),
+            (ENV.replace('LLM_DEFAULT=google/test', 'LLM_DEFAULT='), None),
+            (ENV.replace('https://proxy.example/models', 'http://proxy.example'), None),
+            (ENV.replace('https://proxy.example/models', 'https://proxy.example:bad'), None),
+            (ENV.replace('https://proxy.example/models', 'https://[broken'), None),
+        ):
+            with self.subTest(env=env, model=model):
+                self.requests.clear()
+                self.path.write_text(env)
+                c = self.client(lambda r: completion())
+                with patch.object(c.credentials, 'ensure') as ensure:
+                    code, rows, err = self.run_batch(c, ['--model', model] if model else [])
+                self.assertEqual(code, 1)
+                self.assertEqual(len(rows), 1)
+                self.assertFalse(rows[0]['ok'])
+                self.assertFalse(self.requests)
+                ensure.assert_not_called()
+                self.assertIn('remaining rows were not sent', err)
+
+    def test_first_use_bootstraps_before_resolving_alias(self):
+        self.path.unlink()
+        c = self.client(lambda r: completion())
+        def init(command, **kwargs):
+            Path(command[command.index('--env-file') + 1]).write_text(ENV)
+            return subprocess.CompletedProcess(command, 0)
+        with patch('kaggle_llm.auth.shutil.which', return_value='/mock/bin/kaggle'), \
+                patch('kaggle_llm.auth.subprocess.run', side_effect=init) as run:
+            self.assertEqual(c.prompt('hello', model='test')['text'], 'hello')
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(len(self.requests), 1)
+
+    def test_batch_stops_after_three_consecutive_transient_errors(self):
+        for outcomes in (['timeout'] * 5, [503] * 5, [500, 'timeout', 502, 200, 200]):
+            with self.subTest(outcomes=outcomes):
+                self.requests.clear()
+                def respond(request):
+                    status = outcomes[len(self.requests) - 1]
+                    if status == 'timeout':
+                        raise httpx.ReadTimeout('private details')
+                    return httpx.Response(status)
+                code, rows, err = self.run_batch(self.client(respond))
+                self.assertEqual(code, 1)
+                self.assertEqual(len(self.requests), 3)
+                self.assertEqual([row['ok'] for row in rows], [False] * 3)
+                self.assertIn('remaining rows were not sent', err)
+
+    def test_batch_transient_counter_resets(self):
+        for middle in (200, 400):
+            with self.subTest(middle=middle):
+                self.requests.clear()
+                statuses = [503, 503, middle, 503, 503]
+                def respond(request):
+                    status = statuses[len(self.requests) - 1]
+                    return completion() if status == 200 else httpx.Response(status)
+                code, rows, err = self.run_batch(self.client(respond))
+                self.assertEqual(code, 1)
+                self.assertEqual(len(rows), 5)
+                self.assertEqual(len(self.requests), 5)
+                self.assertEqual(err, '')
+
+    def test_batch_rejects_boolean_ids_before_inference(self):
+        source = StringIO(''.join(json.dumps({'id': value, 'prompt': 'hello'}) + '\n'
+                                 for value in (True, False, 0, 'a')))
+        c = self.client(lambda r: completion())
+        with patch('kaggle_llm.cli.Client', return_value=c), patch('sys.stdin', source), \
+                redirect_stdout(StringIO()) as out:
+            self.assertEqual(main(['batch', '-']), 1)
+        rows = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual([row['ok'] for row in rows], [False, False, True, True])
+        self.assertEqual(len(self.requests), 2)
 
     def test_leading_think_stripped_before_validation(self):
         for options in ({}, {'reasoning': 'none'}, {'reasoning': 'low'}):
@@ -284,6 +365,28 @@ class ClientTests(unittest.TestCase):
                 client.assert_not_called()
                 self.assertEqual(out.getvalue(), '')
                 self.assertIn('Invalid --schema', err.getvalue())
+
+    def test_numeric_options_are_usage_errors_before_input_or_client(self):
+        for command in (['batch', '-'], ['prompt', '--stdin']):
+            for option, values in (
+                ('--max-tokens', ('0', '-1')),
+                ('--temperature', ('-1', '2.1', 'nan', 'inf', '-inf')),
+                ('--timeout', ('0', '-1', 'nan', 'inf', '-inf')),
+            ):
+                for value in values:
+                    argv = ([f'{option}={value}', *command] if option == '--timeout'
+                            else [*command, f'{option}={value}'])
+                    with self.subTest(argv=argv), patch('kaggle_llm.cli.Client') as client, \
+                            patch('sys.stdin') as source, redirect_stdout(StringIO()) as out, \
+                            redirect_stderr(StringIO()) as err:
+                        with self.assertRaises(SystemExit) as caught:
+                            main(argv)
+                        self.assertEqual(caught.exception.code, 2)
+                        client.assert_not_called()
+                        source.read.assert_not_called()
+                        source.__iter__.assert_not_called()
+                        self.assertEqual(out.getvalue(), '')
+                        self.assertIn(option, err.getvalue())
 
     def test_batch_schema_checked_once_and_reused(self):
         path = Path(self.tmp.name) / 'schema.json'
