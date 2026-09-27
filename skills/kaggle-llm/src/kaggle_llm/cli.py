@@ -11,7 +11,7 @@ from .jsonutil import loads
 
 MAX_CONSECUTIVE_TRANSIENT_ERRORS = 3
 REMOTE_ONLY = (('detach', '--detach'), ('max_cost', '--max-cost'), ('concurrency', '--concurrency'),
-               ('no_dedup', '--no-dedup'), ('wait_timeout', '--wait-timeout'), ('execute_in', '--execute-in'))
+               ('dedup', '--dedup'), ('wait_timeout', '--wait-timeout'), ('execute_in', '--execute-in'))
 
 
 def emit(value):
@@ -42,7 +42,8 @@ def _remote_options(parser, *, batch):
         parser.add_argument('--remote', action='store_true',
                             help='Run inside a private Kaggle benchmark task (full model catalog; prompts and '
                                  'responses are stored permanently in your Kaggle account)')
-        parser.add_argument('--no-dedup', action='store_true', help='Keep near-duplicate prompts (remote only)')
+        parser.add_argument('--dedup', action='store_true',
+                            help='Drop near-duplicate prompts before sending; they get no output row (remote only)')
         parser.add_argument('--execute-in', choices=['creation', 'run'],
                             help='Kaggle run that executes the job (remote only; default creation)')
 
@@ -114,7 +115,7 @@ def _remote_batch(parser, args, schema):
         schema_mode=args.schema_mode, model=args.model, max_tokens=args.max_tokens or remote.DEFAULT_MAX_TOKENS,
         temperature=args.temperature, reasoning=args.reasoning, concurrency=args.concurrency or remote.DEFAULT_CONCURRENCY,
         max_cost_usd=remote.DEFAULT_MAX_COST_USD if args.max_cost is None else args.max_cost,
-        dedup=not args.no_dedup, execute_in=args.execute_in or 'creation')
+        dedup=args.dedup, execute_in=args.execute_in or 'creation')
     for row in dropped:
         print(json.dumps({'dropped_duplicate': row}), file=sys.stderr)
     store = remote.JobStore()

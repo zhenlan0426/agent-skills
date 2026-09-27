@@ -168,13 +168,15 @@ def run_job(spec, call, out_path, *, environ=os.environ, sleep=time.sleep, clock
                 else:
                     with lock:
                         state["failed"] += 1
+                        if error.status == 429:  # Still limited after every retry: stop the job.
+                            state["rate_limited"] = True
                     write({**base, "ok": False, "status": error.status, "error": str(error),
                            "attempts": attempts})
             finally:
                 slots.release()
 
-        # A slot is taken before each dispatch, so the cost and deadline checks
-        # happen immediately before the row starts, not when it is queued.
+        # A slot is taken before each dispatch, so the rate-limit, cost and deadline
+        # checks happen immediately before the row starts, not when it is queued.
         concurrency = max(1, int(spec.get("concurrency") or 1))
         slots = threading.Semaphore(concurrency)
         stopped = None
@@ -182,8 +184,10 @@ def run_job(spec, call, out_path, *, environ=os.environ, sleep=time.sleep, clock
             for row in rows:
                 slots.acquire()
                 with lock:
-                    cost = state["cost"]
-                if max_cost is not None and cost >= max_cost:
+                    cost, rate_limited = state["cost"], state.get("rate_limited")
+                if rate_limited:
+                    stopped = "rate_limited"
+                elif max_cost is not None and cost >= max_cost:
                     stopped = "max_cost"
                 elif deadline is not None and clock() - start >= deadline:
                     stopped = "deadline"

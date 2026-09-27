@@ -311,6 +311,17 @@ class RunnerTests(unittest.TestCase):
         self.assertAlmostEqual(lines[-1]['cost_usd'], 3.0)
         self.assertAlmostEqual(summary['cost_usd'], 3.0)
 
+    def test_persistent_429_stops_dispatch(self):
+        # A row still rate-limited after every retry means the rest would be too.
+        call = FakeCall({(TOP, 'prompt 1'): [429], (TOP, 'prompt 2'): 429})
+        summary, lines = self.run_job(make_spec(4, candidates=[TOP]), call)
+        rows = {row['line']: row for row in self.kind(lines, 'row')}
+        self.assertEqual(sorted(rows), [1, 2])
+        self.assertEqual((rows[1]['ok'], rows[1]['attempts']), (True, 2))
+        self.assertEqual((rows[2]['ok'], rows[2]['status'], rows[2]['attempts']), (False, 429, 3))
+        self.assertEqual(lines[-1]['stopped_reason'], 'rate_limited')
+        self.assertEqual((summary['rows_ok'], summary['rows_failed']), (1, 1))
+
     def test_deadline_stops_dispatch(self):
         call = FakeCall(time=self.time, seconds_per_call=100)
         _, lines = self.run_job(make_spec(candidates=[TOP], deadline_seconds=250), call)
@@ -452,7 +463,8 @@ class PrepareJobTests(unittest.TestCase):
     CATALOG = [OPUS, TOP, 'google/gemini-3.8-flash', 'qwen/qwen3-next-80b-a3b-instruct']
 
     def test_spec_contents(self):
-        spec, dropped = remote.prepare_job(self.ROWS, catalog=self.CATALOG, system='Be brief.', max_tokens=100)
+        spec, dropped = remote.prepare_job(self.ROWS, catalog=self.CATALOG, system='Be brief.', max_tokens=100,
+                                           dedup=True)
         self.assertEqual(spec['candidates'], [TOP, OPUS, 'google/gemini-3.8-flash'])
         self.assertEqual([row['line'] for row in spec['rows']], [1, 3])
         self.assertEqual([row['id'] for row in spec['rows']], ['a', 'c'])
@@ -476,8 +488,8 @@ class PrepareJobTests(unittest.TestCase):
         spec, _ = remote.prepare_job(self.ROWS, catalog=self.CATALOG, max_tokens=None, max_cost_usd=None)
         self.assertEqual((spec['options'], spec['max_cost_usd']), ({}, None))
 
-    def test_dedup_can_be_disabled(self):
-        spec, dropped = remote.prepare_job(self.ROWS, catalog=self.CATALOG, dedup=False)
+    def test_dedup_is_opt_in(self):
+        spec, dropped = remote.prepare_job(self.ROWS, catalog=self.CATALOG)
         self.assertEqual((len(spec['rows']), dropped), (3, []))
 
     def test_model_selection(self):
@@ -620,7 +632,21 @@ class OrchestratorTests(unittest.TestCase):
     def test_public_task_is_fatal(self):
         job_id = self.job()
         with self.assertRaisesRegex(KaggleLLMError, 'public'):
-            remote.submit(self.store, FakeBackend(public=True), job_id)
+            remote.submit(self.store, backend := FakeBackend(public=True), job_id)
+        self.assertEqual(self.store.load_state(job_id)['status'], 'failed')
+        self.assertEqual(backend.sources, {})  # Refused before any prompt reached Kaggle.
+
+    def test_task_public_after_push_is_fatal(self):
+        backend, job_id = FakeBackend(), self.job()
+        push = backend.push
+
+        def push_then_publish(slug, source):
+            backend.public = True
+            return push(slug, source)
+
+        backend.push = push_then_publish
+        with self.assertRaisesRegex(KaggleLLMError, 'public'):
+            remote.submit(self.store, backend, job_id)
         self.assertEqual(self.store.load_state(job_id)['status'], 'failed')
 
     def test_mismatched_job_id_in_results_fails(self):
@@ -745,7 +771,7 @@ class CliRemoteTests(unittest.TestCase):
                                 {'id': 2, 'prompt': 'second prompt about bananas'},
                                 {'id': 3, 'prompt': 'third prompt about cherries'},
                                 {'id': 4, 'prompt': 'First prompt about apples!'}])
-        code, out, err = self.cli('batch', path, '--remote')
+        code, out, err = self.cli('batch', path, '--remote', '--dedup')
         self.assertEqual(code, 0, err)
         rows = self.json_lines(out)
         self.assertEqual([(row['line'], row['ok']) for row in rows], [(1, True), (2, True), (3, True)])

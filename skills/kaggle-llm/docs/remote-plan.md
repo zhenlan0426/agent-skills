@@ -164,7 +164,8 @@ each line under a lock:
      `end{stopped_reason:"no_model"}`.
    - Probe cost counts toward the running cost.
 5. **Rows.** Use a thread pool of `concurrency`. Before **dispatching** each row,
-   stop if running cost ≥ `max_cost_usd` (`stopped_reason:"max_cost"`) or if
+   stop if a row already failed with 429 after all its attempts
+   (`stopped_reason:"rate_limited"`), if running cost ≥ `max_cost_usd` (`"max_cost"`), or if
    elapsed ≥ `deadline_seconds` (`"deadline"`). In-flight rows finish.
    Rows never dispatched get **no line**. Per row:
    - retry retryable failures up to `max_attempts`
@@ -213,7 +214,7 @@ class JobStore:
 def prepare_job(rows, *, catalog, system=None, schema=None, schema_mode="prompt",
                 model=None, max_tokens=16000, temperature=None, reasoning=None,
                 concurrency=8, max_attempts=4, max_cost_usd=10.0,
-                deadline_seconds=DEFAULT_DEADLINE, dedup=True, threshold=0.85,
+                deadline_seconds=DEFAULT_DEADLINE, dedup=False, threshold=0.85,
                 execute_in="creation") -> tuple[dict, list[dict]]
 def render_task(spec, *, slug=SLUG) -> str
 def submit(store, backend, job_id, *, slug=SLUG) -> None
@@ -232,7 +233,8 @@ def summary(store, job_id) -> dict
   - otherwise `best.rank(catalog)`
   - if `catalog is None` and no exact model: raise
     `KaggleLLMError("Kaggle catalog unreachable; pass an exact --model")`.
-- With `dedup`, run `near_duplicates` over prompts. The spec keeps first
+- With `dedup` (default off: long shared instructions can make distinct prompts
+  near-duplicates), run `near_duplicates` over prompts. The spec keeps first
   occurrences; `dropped` lists `{"line","id","duplicate_of_line","similarity"}`.
 - `spec["local"] = {"schema": schema, "schema_mode": schema_mode}` (for `collect`).
 - `job_id = uuid4().hex[:12]`.
@@ -250,7 +252,8 @@ def summary(store, job_id) -> dict
 
 **`submit`**
 1. Take an `fcntl` lock on `<jobs root>/runner.lock` for the check and push only.
-2. If `backend.task(slug)` is pending, raise
+2. If `backend.task(slug)` exists and is not verifiably private (`is_public is not False`),
+   mark the job `failed` and raise before pushing anything. If it is pending, raise
    `KaggleLLMError("Another job is still running on Kaggle: <job_id or 'unknown'>")`.
    Find that job via `JobStore.list()` status `submitted`/`running`. Do not wait.
 3. Record `known_runs = {r.id for r in backend.runs(slug)}`.
@@ -319,7 +322,7 @@ def summary(store, job_id) -> dict
 ```
 kaggle-llm batch INPUT --remote [--model M] [--system S] [--schema F] [--schema-mode prompt|native]
     [--max-tokens 16000] [--temperature T] [--reasoning R] [--concurrency 8] [--max-cost 10]
-    [--no-dedup] [--detach] [--wait-timeout 3600] [--execute-in creation|run]
+    [--dedup] [--detach] [--wait-timeout 3600] [--execute-in creation|run]
 kaggle-llm remote status JOB      # summary JSON on stdout
 kaggle-llm remote collect JOB [--wait-timeout S]   # waits if needed, then result rows on stdout
 kaggle-llm remote resume JOB [--detach] [--wait-timeout S]
@@ -361,7 +364,7 @@ kaggle-llm remote list
 - `resume(store, job_id, **overrides)`: the overrides replace spec keys
   (`max_cost_usd`, `concurrency`, `deadline_seconds`). The CLI's `remote resume`
   passes `--max-cost` and the others through.
-- CLI: `--detach`, `--max-cost`, `--concurrency`, `--no-dedup`, `--wait-timeout`,
+- CLI: `--detach`, `--max-cost`, `--concurrency`, `--dedup`, `--wait-timeout`,
   and `--execute-in` without `--remote` are usage errors (exit 2).
 - The tests were written before any implementation. A test that contradicts this
   plan, or is internally inconsistent, is a test bug: fix it and log it in

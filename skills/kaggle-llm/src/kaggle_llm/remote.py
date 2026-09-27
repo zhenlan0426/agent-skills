@@ -67,7 +67,7 @@ class RunInfo(NamedTuple):
 def prepare_job(rows, *, catalog, system=None, schema=None, schema_mode="prompt",
                 model=None, max_tokens=DEFAULT_MAX_TOKENS, temperature=None, reasoning=None,
                 concurrency=DEFAULT_CONCURRENCY, max_attempts=4, max_cost_usd=DEFAULT_MAX_COST_USD,
-                deadline_seconds=DEFAULT_DEADLINE, dedup=True, threshold=0.85,
+                deadline_seconds=DEFAULT_DEADLINE, dedup=False, threshold=0.85,
                 execute_in="creation"):
     """Build a job spec from {"line","id","prompt"} rows. Returns (spec, dropped duplicates).
 
@@ -231,7 +231,7 @@ def _fail(store, job_id, state, reason):
 
 
 def submit(store, backend, job_id, *, slug=SLUG):
-    """Push the job's task file. Refuses while another creation is pending; never waits."""
+    """Push the job's task file. Refuses while another creation is pending or the task is public; never waits."""
     state = store.load_state(job_id)
     if state["status"] != "created":
         raise KaggleLLMError(f"Job {job_id} is already {state['status']}; use kaggle-llm remote collect or resume")
@@ -240,6 +240,10 @@ def submit(store, backend, job_id, *, slug=SLUG):
     with os.fdopen(lock_fd, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         info = backend.task(slug)
+        if info is not None and info.is_public is not False:
+            _fail(store, job_id, state, "task is not verifiably private")
+            raise KaggleLLMError(f"Kaggle task {slug} is public or its visibility could not be verified; "
+                                 "refusing to push prompts to it. Check it on kaggle.com.")
         if info is not None and info.state == "pending":
             running = [job["job_id"] for job in store.list() if job["status"] in ("submitted", "running")]
             raise KaggleLLMError(f"Another job is still running on Kaggle: {running[-1] if running else 'unknown'}. "
