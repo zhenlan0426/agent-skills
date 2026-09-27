@@ -312,7 +312,8 @@ finished at 18:32:07.521, exit 0. Outputs and run marker verified; CUDA result
 demonstration that explicit image selection fixes the intermittent stall.
 
 At the post-run check the prior stalled `...181140-915c129481` was already
-CANCEL_ACKNOWLEDGED. The agent did not cancel it. Its cancellation time matters
+CANCEL_ACKNOWLEDGED. The user confirmed cancelling it; the exact time was not
+specified. The agent did not cancel it. Its cancellation time matters
 for interpretation: it was no longer a simultaneous queued control.
 
 Re-examining `historical-status.json` shows all three original cancelled v1s
