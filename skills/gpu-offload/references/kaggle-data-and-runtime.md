@@ -11,6 +11,10 @@ Prefer existing Kaggle datasets/competition mounts. Repeat `--dataset owner/slug
 `--competition slug`, or `--kernel-source owner/kernel-slug` during preparation.
 Accept competition rules through the website if required; the CLI cannot accept
 them for the user. Inspect mount paths at runtime rather than guessing from titles.
+Observed 2026-09-27: an attached dataset mounted at
+`/kaggle/input/datasets/<owner>/<slug>/`, not `/kaggle/input/<slug>/`. Its files
+were regular files, byte-identical to the upload. Search under `/kaggle/input`
+instead of hardcoding either layout.
 
 For local data or a large source tree, stage only intended files in a separate
 directory, then create a private dataset. This is an upload, not a local packaging

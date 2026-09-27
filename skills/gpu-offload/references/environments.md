@@ -100,6 +100,14 @@ kgpu prepare ./job ... --dataset USER/wheels \
   --setup '-r requirements.txt --wheels /kaggle/input'   # searched recursively
 ```
 
+Measured 2026-09-27 on T4 ×2 with internet off: `wheels` fetched only
+bitsandbytes 0.50.2 and trl 1.14.0 (44 MB). The private dataset mounted at
+`/kaggle/input/datasets/<owner>/<slug>/` as regular files, not symlinks, and
+their sizes and sha256s matched the local wheels. `install` ran uv with
+`--no-index` and took 2 s. torch stayed at 2.10.0+cu128, and a CUDA matmul
+importing trl and bitsandbytes passed. The whole kernel took about 2 minutes
+from start to finish.
+
 `kaggle-env.json` is any Kaggle `out/env.json` from an earlier `--setup` run.
 `wheels` resolves with uv for the target's Python and glibc, prefers the
 versions the target already has, and downloads only what differs. It
