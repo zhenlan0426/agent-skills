@@ -40,7 +40,7 @@ or newer features. These workarounds are version-specific, not platform promises
 Run the offline helper tests with:
 
 ```bash
-python3 tests/test_kgpu.py
+python3 -m pytest tests/ -q
 ```
 
 They exercise packaging and actual generated-runner execution in temporary
@@ -131,6 +131,117 @@ about 15:46 started immediately, and both completed.
 - The kagglesdk `KernelsApiClient` has `cancel_kernel_session`, but it has not
   been exercised. Until it is, cancel stuck runs in the UI.
 
+#### Follow-up investigation — 17:56–18:04 UTC
+
+**Conclusion: no faulty kgpu submission field was established.** The stall did
+not reproduce in the controlled pair below. An intermittent failure in Kaggle's
+API scheduling path remains a plausible explanation, not a proven root cause.
+Do not claim that changing the source format, timeout, pinning, or push spacing
+fixes it. No submission behavior was changed on the strength of these results.
+
+Read all of `scripts/kgpu`, the installed CLI 2.2.2 `kernels_push`, the SDK
+request schema, serializer, and transport. Captured the CLI's serialized request
+offline by replacing `save_kernel` with a recorder, without submitting again.
+Also connected Chrome DevTools to the user's signed-in Chrome and captured the
+UI's actual CommitAndRun request body while saving the investigation's smoke
+kernel as version 2. Browser connection was enabled by the user. Headers and
+cookies were not needed; the saved comparison omits source text.
+
+| Item | CLI 2.2.2 / kgpu | Observed UI Save & Run All |
+| --- | --- | --- |
+| Actual RPC | `https://api.kaggle.com/v1/kernels.KernelsApiService/SaveKernel` | `/api/i/kernels.KernelsService/CommitAndRun` |
+| Identity | `slug`, `newTitle`; new kernel | `scriptId`, `newTitle`, `sequence: 3`; existing kernel |
+| Source | `text`: Python script; `kernelType: script`, `language: python` | `newText`: one-cell nbformat 4 JSON; `editorType: EDITOR_TYPE_SCRIPT`, `scriptLanguageName: python` |
+| Accelerator | `machineShape: NvidiaTeslaT4`, `enableGpu: true`, `enableTpu: false` | `compute.accelerator: NVIDIA_TESLA_T4` |
+| Internet | `enableInternet: false` | `compute.internet.isEnabled: false` |
+| Runtime cap | `sessionTimeoutSeconds: 300` | absent |
+| Execution type | `kernelExecutionType` absent | `versionType: BATCH` |
+| Priority / Docker pinning | absent | absent |
+| Other UI fields | no corresponding fields | `dataSources: []`, `isLanguageTemplate: false`, `workerPoolName: ""` |
+
+The SDK declares 21 SaveKernel fields; the CLI assigns 19, leaving only
+`priority` and `kernel_execution_type` entirely unused. Optional values such
+as `id`, `docker_image`, and `docker_image_pinning_type` are assigned None and
+omitted by serialization; empty source/tag lists are omitted too. The SDK says
+priority is allowed only for certain clients, so it was not changed. Execution
+type defaults to UNSPECIFIED; SAVE_AND_RUN_ALL is available. Current upstream
+CLI also leaves it unset for normal runs and sets QUICK_SAVE only for `--no-run`.
+That is evidence against treating its absence as an obvious helper defect, not
+proof that the server handles it correctly in every case.
+
+`--accelerator` and metadata `machine_shape` populate the **same field**, with
+the flag taking precedence. Moving it to metadata cannot change this payload.
+An offline capture of both paths confirmed identical serialized requests
+(`accelerator-equivalence.json`).
+The UI still uses the script editor type, despite transporting a notebook
+container. The completed `__script__.ipynb` / NbConvert log is not evidence of
+a submission mistake. The base64 extraction and subprocess run only after the
+worker starts; they cannot themselves execute while the job remains QUEUED.
+These observations do not rule out a server scheduling bug specific to script
+requests. UI omission of the timeout is a real difference, but the same 300 s
+CLI timeout works in both successful controls and previously stalled jobs.
+
+**Spacing correction.** Slug timestamps are preparation times, not necessarily
+push times. Local `submission-attempt.json` records show:
+
+| Original job suffix | Attempt UTC | Gap from preceding recorded attempt |
+| --- | --- | --- |
+| `133455-41c1b73f2c` | 13:36:15.425 | unknown |
+| `134950-00d9045fa7` (HTTP 400) | 13:49:56.976 | 13m41.551s |
+| `135034-27e8be47cf` | 13:50:35.040 | 38.064s |
+| `144446-991d9872ff` | 14:44:46.967 | **54m11.926s** |
+| `160002-df55fe833c` | 16:00:02.909 | 75m15.943s, with UI reruns during this gap |
+| `160253-c183007b81` | 16:02:53.706 | 2m50.797s |
+
+Thus “every stall followed another push within three minutes” is not supported
+by the recorded pushes: the 14:44 case is a counterexample, although an older
+queued job still existed. Other unrecorded sessions cannot be inferred from
+these timestamps.
+
+**Controlled live pair.** Fresh job directories; same 358-byte ZIP, 2,462-byte
+wrapper, private T4, internet off, no datasets, 300 s runtime cap, and
+`python -u smoke.py`. Only generated identity and submission timing changed.
+
+| Kernel suffix | Push UTC | Wrapper start UTC | Outcome |
+| --- | --- | --- | --- |
+| `175654-c3029d243b` | 17:56:54.816 | 17:57:00.682 | COMPLETE, exit 0 |
+| `175848-1f990a39dc` | 17:58:54.854 | 17:59:05.868 | COMPLETE, exit 0 |
+
+The first followed a long gap in recorded pushes; the second followed it by
+**120.038 seconds**, after the first completed. Approximate push-to-wrapper
+latencies were 5.87 and 11.01 s (local versus remote clocks). Both reported
+Tesla T4 and CUDA arithmetic result 13.0. Downloaded outputs and run markers
+were verified. The UI capture created version 2 of the first smoke kernel;
+its wrapper ran 18:01:56.750–18:02:12.715 and also passed. This UI rerun is a
+request comparison, not a one-variable causal experiment. Total: two new CLI
+pushes and one UI rerun; no cancellations or deletions. The fourth test slot
+was not used because there was no failing control to distinguish a field fix.
+
+Version-specific SDK checks, using `version_label="v1"` and `"v2"`, confirmed
+all three original stalled v1s are CANCEL_ACKNOWLEDGED with empty failure
+messages, and their v2s are COMPLETE. Bare labels `"1"`/`"2"` return 404;
+latest-only CLI status would conceal this history. Both new smoke versions
+were also confirmed COMPLETE. GPU quota used rose from 435.427097 to
+492.307097 seconds (56.88 s); GPU reserved and TPU used/reserved were zero at
+the final check. Whole-second duration parsing was patched only in the
+inspection process; quota totals should not be inferred from old snapshots.
+
+Artifacts: `~/.cache/kgpu/queue-investigation-20260927/`, including fresh
+`baseline/` and `rapid/` jobs and outputs, `ui-results/`,
+`cli-request-summaries.json`, `ui-request-summary.json`,
+`historical-status.json`, and `quota-after.json`. `inspect_requests.py` captures
+requests offline and performs read-only status/quota queries; it does not push.
+
+**User-approved mitigation:** `kgpu wait --queue-timeout 900` is now the default.
+It returns 124 with the kernel URL and UI cancel + Save Version > Save & Run All
+instructions when a fresh query still reports QUEUED after the observation
+limit. `queued.json` retains the first observation across short wait calls and
+is cleared after a different state is observed. The timer starts at observation,
+not submission, and is not a continuous server history. `--queue-timeout 0`
+disables it; the existing per-call `--timeout` remains independent. The helper
+never cancels or resubmits automatically. Offline tests cover persistence,
+poll bounds, state transitions, disabling the limit, and recovery diagnostics.
+
 These observations do not establish Kaggle's exact script or request limit, or
 guarantee future service acceptance. The helper now limits embedded archives to
 512 KiB and final UTF-8 source to 704 KiB; the latter includes the base64 payload,
@@ -151,6 +262,7 @@ Larger projects must use the private-dataset/bootstrap path in
 - [Kernel CLI commands](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md)
 - [Kernel metadata](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels_metadata.md)
 - [Official CLI source](https://github.com/Kaggle/kaggle-cli/blob/main/src/kaggle/api/kaggle_api_extended.py)
+- [Chrome DevTools connection setup](https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/main/docs/advanced-usage.md)
 - [Dataset metadata](https://github.com/Kaggle/kaggle-cli/blob/main/docs/datasets_metadata.md)
 
 The 20 MiB unpacked limit remains a local packaging guardrail. It is separate

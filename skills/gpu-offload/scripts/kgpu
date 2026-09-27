@@ -256,7 +256,9 @@ def readable_logs(output):
 
 
 def wait(args):
-    _, job = read_job(args.job)
+    path, job = read_job(args.job)
+    queue_timeout = getattr(args, 'queue_timeout', 900)
+    queue_record = path / 'queued.json'
     deadline = time.monotonic() + args.timeout
     while True:
         remaining = deadline - time.monotonic()
@@ -269,13 +271,39 @@ def wait(args):
             print('Local wait expired during status request; remote job was not stopped.')
             return 124
         print(output, end='', flush=True)
+        queue_remaining = None
+        if state == 'queued':
+            # Persist the first observation across short `wait` invocations.
+            # Submission time is not proof that the job spent all that time queued.
+            now = time.time()
+            queued = json.loads(queue_record.read_text()) if queue_record.exists() else {}
+            if queued.get('run_id') != job['run_id'] or queued.get('since', now + 1) > now:
+                queued = {'run_id': job['run_id'], 'since': now}
+                save(queue_record, queued)
+            if queue_timeout:
+                queue_elapsed = now - queued['since']
+                queue_remaining = queue_timeout - queue_elapsed
+                if queue_remaining <= 0:
+                    print(f'Still QUEUED {int(queue_elapsed)} seconds after first observed. '
+                          'Local wait stopped; remote job was not cancelled.\n'
+                          'Kernel URL: https://www.kaggle.com/code/' + job['ref'] + '\n'
+                          'Workaround: open the kernel in Kaggle, cancel the queued version '
+                          'in the UI, then use Save Version > Save & Run All. '
+                          'This creates a new version and uses GPU quota. '
+                          'kgpu has not cancelled or resubmitted anything.')
+                    return 124
+        else:
+            queue_record.unlink(missing_ok=True)
         if state == 'complete':
             return 0
         if state in {'error', 'cancelacknowledged', 'cancel_acknowledged', 'cancelled', 'canceled'}:
             return 1
         if state not in {'queued', 'running', 'cancelrequested', 'cancel_requested', 'new_script'}:
             raise ValueError(f'Unknown remote state: {state}')
-        time.sleep(min(args.poll, max(0, deadline - time.monotonic())))
+        delay = min(args.poll, max(0, deadline - time.monotonic()))
+        if queue_remaining is not None:
+            delay = min(delay, max(0, queue_remaining))
+        time.sleep(delay)
 
 
 def pull(args):
@@ -311,6 +339,13 @@ def positive(value):
     return number
 
 
+def nonnegative(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError('must be a nonnegative integer')
+    return number
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest='action', required=True)
@@ -334,6 +369,9 @@ def main():
         if action == 'wait':
             p.add_argument('--timeout', type=positive, default=45)
             p.add_argument('--poll', type=positive, default=15)
+            p.add_argument('--queue-timeout', type=nonnegative, default=900,
+                           help='stop waiting after this many seconds observed QUEUED across '
+                                'wait calls (default 900; 0 disables); does not cancel the job')
         if action == 'pull':
             p.add_argument('output')
             p.add_argument('--partial', action='store_true')

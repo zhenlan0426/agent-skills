@@ -255,6 +255,58 @@ class HelperTests(unittest.TestCase):
         with patch.dict(G, {'cli': lambda *a, **k: 'testuser/job has status "KernelWorkerStatus.COMPLETE"\n'}):
             self.assertEqual(kg.status({'ref': 'testuser/job'})[0], 'complete')
 
+    def test_queue_timeout_survives_short_waits_and_never_resubmits(self):
+        self.prepare()
+        clock = SimpleNamespace(now=10000.0)
+        clock.time = clock.monotonic = lambda: clock.now
+        clock.sleep = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        args = SimpleNamespace(job=str(self.job), timeout=45, poll=15, queue_timeout=900)
+        remote = Mock(return_value=('queued', 'QUEUED\n'))
+        unexpected_cli = Mock(side_effect=AssertionError('wait must not mutate remote state'))
+        output = io.StringIO()
+        with patch.dict(G, {'time': clock, 'status': remote, 'cli': unexpected_cli}), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(kg.wait(args), 124)
+            self.assertNotIn('Workaround:', output.getvalue())
+            self.assertEqual(json.loads((self.job / 'queued.json').read_text())['since'], 10000)
+            clock.now = 10900
+            self.assertEqual(kg.wait(args), 124)
+        self.assertIn('https://www.kaggle.com/code/', output.getvalue())
+        self.assertIn('Save Version > Save & Run All', output.getvalue())
+        self.assertIn('remote job was not cancelled', output.getvalue())
+        unexpected_cli.assert_not_called()
+
+    def test_queue_limit_caps_poll_and_resets_on_running(self):
+        self.prepare()
+        clock = SimpleNamespace(now=10000.0)
+        clock.time = clock.monotonic = lambda: clock.now
+        clock.sleep = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        args = SimpleNamespace(job=str(self.job), timeout=100, poll=60, queue_timeout=10)
+        remote = Mock(return_value=('queued', 'QUEUED\n'))
+        with patch.dict(G, {'time': clock, 'status': remote}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(kg.wait(args), 124)
+            self.assertEqual(clock.now, 10010)
+            # A fresh status wins over an expired queue timer.
+            remote.side_effect = [('running', 'RUNNING\n'), ('complete', 'COMPLETE\n')]
+            self.assertEqual(kg.wait(args), 0)
+        self.assertFalse((self.job / 'queued.json').exists())
+
+    def test_queue_timeout_can_be_disabled_and_terminal_state_clears_record(self):
+        self.prepare()
+        clock = SimpleNamespace(now=10000.0)
+        clock.time = clock.monotonic = lambda: clock.now
+        clock.sleep = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        args = SimpleNamespace(job=str(self.job), timeout=1000, poll=500, queue_timeout=0)
+        remote = Mock(return_value=('queued', 'QUEUED\n'))
+        output = io.StringIO()
+        with patch.dict(G, {'time': clock, 'status': remote}), contextlib.redirect_stdout(output):
+            self.assertEqual(kg.wait(args), 124)
+            self.assertEqual(clock.now, 11000)
+            self.assertNotIn('Workaround:', output.getvalue())
+            remote.return_value = ('error', 'ERROR\n')
+            self.assertEqual(kg.wait(args), 1)
+        self.assertFalse((self.job / 'queued.json').exists())
+
     def test_json_event_logs_and_plain_text(self):
         events = [{'stream_name': 'stdout', 'time': 1, 'data': 'hello\n'},
                   {'stream_name': 'stderr', 'time': 2, 'data': 'error\n'}]

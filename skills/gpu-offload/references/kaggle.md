@@ -88,6 +88,13 @@ probe fails a GPU job instead of silently continuing on CPU.
   wait expires, and 2 for an API/parse problem. Local timeouts leave remote work
   running. Poll in short calls, keeping the user updated. Logs may be delayed;
   lack of log text is not evidence the job stopped.
+  It also returns 124 after 15 minutes observed QUEUED, with the kernel URL
+  and the UI cancel + Save Version > Save & Run All workaround. Configure this
+  with `--queue-timeout SECONDS` (default 900; 0 disables). The first QUEUED
+  observation is retained in `queued.json` across short wait calls and cleared
+  when a subsequent wait observes another state. This is an observation-based
+  timer, not server queue history; the existing `--timeout` (default 45 seconds)
+  still bounds each local call. No cancellation or resubmission is automatic.
 - `pull` requires a new/empty local output directory, downloads all available
   output pages, and verifies the run marker and exit code. A missing marker or
   nonzero exit is not success; inspect the logs and any partial results. Inspect
