@@ -117,7 +117,7 @@ kaggle-llm remote resume JOB [--max-cost USD] [--concurrency N] [--detach] [--wa
 kaggle-llm remote list
 ```
 
-Flags: `--model`, `--system`, `--schema`, `--schema-mode`, `--max-tokens`, `--temperature` and `--reasoning` behave as in local batch. Remote-only: `--concurrency` (1-16, default 4), `--max-cost USD` (> 0), `--no-dedup`, `--detach`, `--wait-timeout` (default 3600 s), and `--execute-in creation|run`. Remote-only flags without `--remote` are usage errors (exit 2).
+Flags: `--model`, `--system`, `--schema`, `--schema-mode`, `--max-tokens`, `--temperature` and `--reasoning` behave as in local batch. Remote-only: `--concurrency` (1-16, default 8), `--max-cost USD` (> 0), `--no-dedup`, `--detach`, `--wait-timeout` (default 3600 s), and `--execute-in creation|run`. Remote-only flags without `--remote` are usage errors (exit 2).
 
 **What happens.** Every input row is validated first (object with nonempty string `prompt` and optional string/integer `id`). Any invalid row is a usage error (exit 2) and nothing is sent; local batch instead emits error rows. Near-duplicate prompts (5-word shingle Jaccard ≥ 0.85 after casefolding and removing punctuation; exact match for prompts under 5 words) are dropped, keeping the first occurrence, and listed on stderr as `{"dropped_duplicate": {"line", "id", "duplicate_of_line", "similarity"}}`. Messages and generation options are built exactly as `Client.prompt` builds them. The job is written to `~/.cache/kaggle-llm/jobs/<job_id>/` (override with `KAGGLE_LLM_JOBS_DIR`; directories are 0700), rendered to a percent-format task file (`task.py`, with the spec gzip+base64 embedded), and pushed as a new task version. Kaggle executes a pushed version once on creation. That creation run is the job: it ignores the default model and calls the proxy directly over HTTP.
 
@@ -132,7 +132,7 @@ Flags: `--model`, `--system`, `--schema`, `--schema-mode`, `--max-tokens`, `--te
 - One job at a time: a push is refused while the previous version is still being created, and the CLI reports which local job holds it.
 - Latency: about 75 s of Kaggle overhead per job plus the calls.
 
-**Privacy and permanence.** Prompts, responses, and full conversation logs are stored in the Kaggle task (Kaggle also keeps its own run files), privately and permanently: Kaggle cannot delete tasks. After every push the CLI checks that the task and its backing notebook are private and fails loudly otherwise. It never publishes. Local job directories hold the same data; delete them when no longer needed.
+**Privacy and permanence.** Prompts (embedded in each task version's source) and raw responses (the run's `kaggle_llm_results.jsonl` output) are stored in the Kaggle task, privately and permanently: Kaggle cannot delete tasks. Kaggle's own run files hold only the numeric summary, because the runner calls the proxy directly rather than through kbench. After every push the CLI checks that the task and its backing notebook are private and fails loudly otherwise. It never publishes. Local job directories hold the same data; delete them when no longer needed.
 
 **Fallback.** `--execute-in run` makes the creation run a no-op and schedules a separate `kaggle b t run -m <model>` for the pinned model. Use it only if creation runs lose full-catalog access (every candidate 403/404 in the probe).
 

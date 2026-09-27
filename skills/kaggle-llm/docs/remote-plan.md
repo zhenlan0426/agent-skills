@@ -210,7 +210,7 @@ class JobStore:
 
 def prepare_job(rows, *, catalog, system=None, schema=None, schema_mode="prompt",
                 model=None, max_tokens=None, temperature=None, reasoning=None,
-                concurrency=4, max_attempts=4, max_cost_usd=None,
+                concurrency=8, max_attempts=4, max_cost_usd=None,
                 deadline_seconds=DEFAULT_DEADLINE, dedup=True, threshold=0.85,
                 execute_in="creation") -> tuple[dict, list[dict]]
 def render_task(spec, *, slug=SLUG) -> str
@@ -316,7 +316,7 @@ def summary(store, job_id) -> dict
 
 ```
 kaggle-llm batch INPUT --remote [--model M] [--system S] [--schema F] [--schema-mode prompt|native]
-    [--max-tokens N] [--temperature T] [--reasoning R] [--concurrency 4] [--max-cost USD]
+    [--max-tokens N] [--temperature T] [--reasoning R] [--concurrency 8] [--max-cost USD]
     [--no-dedup] [--detach] [--wait-timeout 3600] [--execute-in creation|run]
 kaggle-llm remote status JOB      # summary JSON on stdout
 kaggle-llm remote collect JOB [--wait-timeout S]   # waits if needed, then result rows on stdout
@@ -530,6 +530,108 @@ Every push adds a permanent private version. Keep experiments minimal.
   for Phase 2 experiments and Phase 5 acceptance only. E5 (a real
   `submit`/`wait`/`collect` round trip) and acceptance step 1 cover the same
   path.
+
+### Phase 2 pre-flight (every push below)
+Each task file was rendered with `render_task(spec, slug=SLUG)`, passed
+`KaggleApi._validate_task_in_file` and `_convert_py_to_notebook`, and the
+converted notebook's code cells were exec'd with the test fakes (`exec_task`,
+`FakeCall`); the job line's `job_id` and the `end` line were checked. All
+notebooks were 12-13 KB. `Public: False` was confirmed after every push.
+
+### E3: direct proxy HTTP from the creation run (2026-09-27)
+- Spec: 2 real rows, `candidates=[openai/gpt-6-astra, anthropic/claude-opus-5@default]`,
+  `max_tokens` 512, `max_cost_usd` 0.5, job `93dd81518b4a`. Pushed with
+  `kaggle b t push` at 19:48:08Z; version 2; creation run 3326594
+  (`gemini-3.7-flash`) ran 19:48:56-19:48:59Z; the CLI saw Completed at
+  19:49:14Z (66 s end to end).
+- Probe: GPT-6 Astra answered first (`[{gpt-6-astra, 200}]`), so Opus was not
+  tried. Both rows ok on the first attempt, `stopped_reason: null`,
+  `cost_usd` 0.00373 (probe included).
+- `raw` is a full Chat Completions object: `choices[0].finish_reason: "stop"`,
+  `model: "openai/gpt-6-astra"`, `usage.cost.{input,output}_tokens_cost_nanodollars`,
+  `usage.completion_tokens_details.reasoning_tokens`, `total_backend_latency_ms`
+  (1.4-1.9 s). `client.finish` accepted both locally.
+- **Decision: keep direct HTTP** (`proxy_call`); no kbench fallback needed.
+- Side finding: Kaggle's run files (`run.json`, `result.json`, `atif.json`)
+  contain no prompts or responses for these calls, because they bypass kbench.
+  `result.json` holds only the `run_job` return value as rewards. Section 2's
+  "`run.json` stores full conversations" applies to kbench calls only. Prompts
+  stay in the task source and responses in our results file. api.md's privacy
+  paragraph said "full conversation logs" were stored; corrected.
+
+### E4: rate limits at concurrency (2026-09-27)
+- Spec: 40 distinct one-word-answer prompts (20 capitals, 20 rhymes; no
+  near-duplicates), `candidates=[openai/gpt-6-astra]`, `max_tokens` 256,
+  `max_cost_usd` 0.5.
+- Concurrency 4 (job `478848247c95`, version 3, pushed 19:49:57Z, run
+  19:50:46-19:51:03Z = 17 s): 40/40 ok, **0 rows with `attempts > 1`**, 0
+  failures, `cost_usd` 0.04202, backend latency p50 1.2 s, max 4.2 s.
+- Concurrency 8 (job `e2fcacff94c5`, version 4, pushed 19:51:46Z, run
+  19:52:44-19:52:57Z = 13 s): 40/40 ok, **0 retries**, 0 failures,
+  `cost_usd` 0.04372, p50 1.2 s, max 4.0 s.
+- **Decision: default concurrency 8** (highest tested with < 10% retries).
+  Added `remote.DEFAULT_CONCURRENCY = 8`, used by `prepare_job` and the CLI;
+  SKILL.md, api.md and sections 3.6/3.7 updated. Higher values were not tested
+  (the plan tests 4 and 8; pushes stay minimal). 40 rows is a small sample;
+  429s at scale are still handled by the retry/backoff.
+- Test change: `PrepareJobTests.test_spec_contents` asserted the default
+  `concurrency` 4; it now asserts 8 (live result, per plan 3.8).
+
+### E5: re-push through the SDK backend (2026-09-27)
+- The E3 rows again (new job `197c8cac9626`), via `JobStore.create` →
+  `remote.submit` → `remote.wait` → `remote.collect` with
+  `remote.default_backend()`. This was the **first live push through
+  `SdkBackend.push`** (replaces the skipped Phase 3 smoke test).
+- `submit` pushed in 2.3 s: version 5, `known_runs=[3326953]` (version 4's
+  run). `task()` right after: `TaskInfo(5, 'pending', None, is_public=False)`.
+- A second `submit` (1-row spare job) while creation was pending was refused
+  by the guard: "Another job is still running on Kaggle: 197c8cac9626 ...";
+  nothing was pushed. The spare local job record was deleted.
+- Not tested: whether Kaggle's **server** refuses a push while creation is
+  pending. The CLI's "creation is still pending" error (section 2) is a
+  client-side check in `benchmarks_tasks_push_cli`; `SdkBackend.push` calls
+  the API directly, so `submit`'s check under `runner.lock` is our only guard.
+  I did not probe the server: that push would add a permanent version racing a
+  live creation, and an odd push is what broke `kaggle-llm-runner`.
+- `wait` matched new run 3327034 (not in `known_runs`), downloaded it, and
+  the job line's `job_id` matched: status `downloaded` 73.5 s after the
+  submit started. `collect` returned 2 ok rows with `model: openai/gpt-6-astra`;
+  `summary`: `cost_usd` 0.00418, `rows_ok` 2, `rows_not_run` 0. The task
+  ended `TaskInfo(5, 'completed', None, False)`.
+- Observed: `SdkBackend.runs()` (`_fetch_task_runs`) lists **only the current
+  version's runs** (after E5 it returned just 3327034). `wait`'s matching is
+  unaffected: all runs visible before the push are in `known_runs`, and every
+  run of the new version is new.
+- Phase 2 spend so far (E3-E5): about $0.094 of proxy quota.
+
+### Order decision: Phase 5 before E2 (2026-09-27)
+- E2 keeps the task busy for up to 12 h, and no push is possible while its
+  creation is pending. The user chose to run Phase 5 acceptance first and E2
+  last. Acceptance jobs take seconds, so the placeholder `DEFAULT_DEADLINE`
+  (39600) cannot affect them. `DEFAULT_DEADLINE` is set from E2 afterwards.
+
+### Phase 5 step 1: stopped on proxy 403s (2026-09-27 19:58Z)
+- Input: 50 varied prompts asking for brief answers, 3 of them near-duplicates
+  (two case/punctuation variants at similarity 1.0, one one-word change at
+  0.931). Command: `kaggle-llm batch prompts50.jsonl --remote --max-cost 2`
+  (no `--max-tokens`; default concurrency 8). Pre-flight passed on the real
+  spec (15 KB notebook, 47 rows).
+- Job `168937c24ce8`, version 6, pushed 19:58:30Z; creation run 3327508 ran
+  19:59:17-19:59:21Z; the CLI finished at 19:59:40Z. `Public: False`.
+- As expected: `dropped_duplicates: 3` (lines 11, 26, 50), 47 output rows,
+  probe `[{gpt-6-astra, 200}]`, `model: openai/gpt-6-astra`.
+- **Not as expected:** 1 row ok (line 5), **46 rows `HTTP 403` on their first
+  attempt** (403 is not retried). `cost_usd` 0.00494; exit 1. The runner keeps no
+  response bodies, so the reason for the 403 is unknown.
+- Up to E5, 84 calls from 4 kernels (including 40 at concurrency 8) had no
+  403 at all. Candidate causes, none verified: a quota or spend limit on the
+  account or on GPT-6 Astra that returns 403 rather than 429; a request-rate or
+  abuse limit; a permission change like the one after E1.
+- Per the user's rules, stopped: no more pushes and no proxy probes. Phase 5
+  steps 2-6 and E2 are blocked until the user decides.
+- Behavior worth a decision: in the kernel, a 403 fails only that row, and
+  dispatch continues, so a revoked or exhausted token still tries every row.
+  Local `batch` treats 403 as batch-fatal and stops. Not changed.
 
 ## 7. Acceptance (Phase 5)
 

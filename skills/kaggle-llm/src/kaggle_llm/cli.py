@@ -32,7 +32,7 @@ def _options(parser):
 def _remote_options(parser, *, batch):
     parser.add_argument('--max-cost', type=float, metavar='USD',
                         help='Stop dispatching rows once the job has spent this much (remote only)')
-    parser.add_argument('--concurrency', type=int, help='Parallel calls inside the Kaggle job, 1-16 (default 4)')
+    parser.add_argument('--concurrency', type=int, help=f'Parallel calls inside the Kaggle job, 1-16 (default {remote.DEFAULT_CONCURRENCY})')
     parser.add_argument('--detach', action='store_true', help='Print {"job_id": ...} after the push and exit')
     parser.add_argument('--wait-timeout', type=float, metavar='SECONDS',
                         help=f'Stop waiting after this long; the job continues (default {remote.DEFAULT_WAIT_TIMEOUT})')
@@ -110,7 +110,7 @@ def _remote_batch(parser, args, schema):
     spec, dropped = remote.prepare_job(
         rows, catalog=None if exact else best.fetch_catalog(), system=args.system, schema=schema,
         schema_mode=args.schema_mode, model=args.model, max_tokens=args.max_tokens,
-        temperature=args.temperature, reasoning=args.reasoning, concurrency=args.concurrency or 4,
+        temperature=args.temperature, reasoning=args.reasoning, concurrency=args.concurrency or remote.DEFAULT_CONCURRENCY,
         max_cost_usd=args.max_cost, dedup=not args.no_dedup, execute_in=args.execute_in or 'creation')
     for row in dropped:
         print(json.dumps({'dropped_duplicate': row}), file=sys.stderr)

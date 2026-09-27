@@ -38,6 +38,7 @@ DEFAULT_WAIT_TIMEOUT = 3600  # CLI wait before detaching; the job keeps running 
 MAX_SOURCE_BYTES = 1_000_000
 MAX_PAYLOAD_BYTES = 950_000
 SPEC_VERSION = 1
+DEFAULT_CONCURRENCY = 8  # E4: 0 retries in 40 rows at both 4 and 8
 BACKOFF_SECONDS = 5.0
 MAX_CONCURRENCY = 16
 RESUME_OVERRIDES = ("max_cost_usd", "concurrency", "deadline_seconds")
@@ -59,7 +60,7 @@ class RunInfo(NamedTuple):
 
 def prepare_job(rows, *, catalog, system=None, schema=None, schema_mode="prompt",
                 model=None, max_tokens=None, temperature=None, reasoning=None,
-                concurrency=4, max_attempts=4, max_cost_usd=None,
+                concurrency=DEFAULT_CONCURRENCY, max_attempts=4, max_cost_usd=None,
                 deadline_seconds=DEFAULT_DEADLINE, dedup=True, threshold=0.85,
                 execute_in="creation"):
     """Build a job spec from {"line","id","prompt"} rows. Returns (spec, dropped duplicates)."""
