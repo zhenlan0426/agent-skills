@@ -46,6 +46,10 @@ KEY_PACKAGES = ['torch', 'torchvision', 'torchaudio', 'triton', 'xformers', 'fla
 # Packages whose wheels need a newer GPU than some targets have. Checked before
 # installing so a T4 fails in seconds instead of after a 20-minute source build.
 MIN_CAPABILITY = {'flash-attn': (8, 0)}
+# PyPI has only sdists of these, so a plain name means compiling CUDA on the
+# target. Measured on Colab G4 (48 vCPU, MAX_JOBS=40): flash-attn 2.8.3 against
+# torch 2.11/py3.13 was still building at 25 min when the VM was lost.
+SOURCE_ONLY = {'flash-attn'}
 # One site outside PyPI so a PyPI-only allowlist (competition kernels) still
 # shows as "online" if it lets PyPI through.
 PROBE_URLS = ['https://pypi.org/simple/pip/', 'https://huggingface.co']
@@ -128,7 +132,8 @@ def torch_info(python):
             'print(json.dumps({"version": torch.__version__, "cuda": torch.version.cuda,'
             ' "cudnn": torch.backends.cudnn.version(), "cuda_available": c,'
             ' "devices": torch.cuda.device_count() if c else 0,'
-            ' "bf16": bool(c and torch.cuda.is_bf16_supported()),'
+            # is_bf16_supported() is True on a T4 (emulated); native needs sm80+.
+            ' "bf16": bool(c and torch.cuda.get_device_capability() >= (8, 0)),'
             ' "arch_list": torch.cuda.get_arch_list() if c else []}))')
     r = run([python, '-c', code], timeout=300)
     if r.returncode:
@@ -349,6 +354,14 @@ def cmd_install(a):
         return 2
 
     before = installed(python)
+    builds = [l for n, l in kept if n in SOURCE_ONLY and n not in before
+              and not re.search(r'\.whl\b', l)]
+    if builds:
+        say(f'{builds[0]!r} would compile CUDA code here (PyPI has no wheel). Pass '
+            f'--skip {requirement_name(builds[0])} and use attn_implementation="sdpa", or '
+            'point the requirement at a prebuilt wheel matching this torch/CUDA/python '
+            '(name @ https://.../x.whl).')
+        return 2
     pins = {k: v for k, v in before.items() if PROTECTED.match(k) and k not in allow}
     conflicts = [(n, l) for n, l in kept if n in pins and not satisfied_by(l, pins[n])]
     for n, l in conflicts:

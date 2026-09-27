@@ -375,7 +375,7 @@ def cmd_setup(a):
         "_cgpu_rc = _cgpu_rc or p.wait()\n" for step in steps)
     rc = exec_py(a.session, code, timeout=str(a.timeout), check=False)
     if rc:
-        die(f"setup failed (exit {rc}); report at {REMOTE_ROOT}/envsetup.json", rc)
+        die(f"setup failed (exit {rc}); its reason is in the output above", rc)
 
 
 def cmd_start(a):

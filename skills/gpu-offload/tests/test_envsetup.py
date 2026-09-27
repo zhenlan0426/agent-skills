@@ -87,6 +87,17 @@ class InstallGuards(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('--skip flash-attn', out)
 
+    def test_flash_attn_source_build_refused_but_wheel_allowed(self):
+        code, out = self.run_install(install_args(packages=['flash-attn']), {}, cap=(12, 0))
+        self.assertEqual(code, 2)
+        self.assertIn('would compile', out)
+        # Already installed: nothing to build, so the installer is reached.
+        with self.assertRaises(AssertionError):
+            self.run_install(install_args(packages=['flash-attn']), {'flash-attn': '2.8.3'}, cap=(8, 9))
+        with self.assertRaises(AssertionError):
+            self.run_install(install_args(packages=['flash-attn @ https://x/flash_attn-2.8.3-cp313-linux_x86_64.whl']),
+                             {}, cap=(12, 0))
+
     def test_local_base_interpreter_refused(self):
         with patch.dict(G, {'in_venv': lambda python: False}):
             out = io.StringIO()
