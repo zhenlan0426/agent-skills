@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""cgpu: run GPU jobs on Google Colab through the official `colab` CLI.
+
+Wraps the patterns that were verified against colab-cli 0.7.4:
+  * a job runs as a subprocess inside ONE blocking kernel cell, so the kernel
+    stays busy (Colab keeps busy runtimes alive) and the job survives the local
+    client disconnecting;
+  * the local `colab exec` client is detached once the job has started (it
+    busy-waits a full CPU core otherwise);
+  * progress is read by downloading the VM-side log (the Contents API works
+    while the kernel is busy; a second `colab exec` would queue behind the job).
+
+Usage:
+  cgpu up SESSION GPU [--high-mem]        GPU: T4 L4 G4 A100 H100 cpu
+  cgpu push SESSION LOCAL [REMOTE]        file or dir (dirs are tarred); default /content/<basename>
+  cgpu secrets SESSION [kaggle] [hf]      copy ~/.kaggle/kaggle.json / HF token onto the VM
+  cgpu start SESSION [--cwd DIR] -- CMD   start CMD (a shell string) as a background job
+  cgpu logs SESSION [-n N]                tail the current job's log
+  cgpu wait SESSION [--poll SECS]         block until the job ends; exits with its code
+  cgpu kill SESSION                       SIGTERM the job's process group
+  cgpu pull SESSION REMOTE LOCAL          file or dir (dirs are tarred on the VM)
+  cgpu sh SESSION -- CMD                  run a short shell command (kernel must be idle)
+  cgpu down SESSION                       stop the VM and print the compute-unit balance
+  cgpu ls                                 sessions + compute-unit usage
+
+Env: CGPU_AUTH (default oauth2) is passed as `colab --auth=...`.
+"""
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import uuid
+from functools import partial
+from pathlib import Path
+
+print = partial(print, flush=True)  # keep ordering with colab's own output
+
+AUTH = os.environ.get("CGPU_AUTH", "oauth2")
+GPUS = {"T4", "L4", "G4", "A100", "H100"}
+STATE_DIR = Path.home() / ".cache" / "cgpu"
+REMOTE_ROOT = "/content/.cgpu"
+TAR_EXCLUDES = {".git", "__pycache__", ".venv", "venv", "node_modules", "wandb",
+                ".ipynb_checkpoints", ".mypy_cache", ".pytest_cache"}
+# `colab exec --timeout` is a wall-clock budget; anything short kills the
+# client (not the job) with a TimeoutError traceback and exit 1.
+LONG = str(7 * 24 * 3600)
+CHUNK = 40 * 1000 * 1000
+
+
+def die(msg, code=1):
+    print(f"cgpu: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def colab(*args, capture=False, check=True, stdin=None, **kw):
+    cmd = ["colab", f"--auth={AUTH}", *args]
+    r = subprocess.run(cmd, text=True, input=stdin,
+                       capture_output=capture, **kw)
+    if check and r.returncode != 0:
+        if capture:
+            sys.stderr.write(r.stdout + r.stderr)
+        die(f"`{' '.join(cmd[:4])} ...` failed (exit {r.returncode})", r.returncode)
+    return r
+
+
+RC_MARK = "__CGPU_RC__="
+
+
+def exec_py(session, code, timeout="600", check=True):
+    """Run Python in the kernel, stream its output, return an exit code.
+
+    `colab exec` exits 0 even when the cell raises, so the cell reports its own
+    status: it prints RC_MARK + `_cgpu_rc` (code may set it) as its last act;
+    no marker means the cell died with an exception. Kernel must be idle.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+        f.write(f"_cgpu_rc = 0\n{code}\nprint('{RC_MARK}' + str(_cgpu_rc))\n")
+    try:
+        p = subprocess.Popen(["colab", f"--auth={AUTH}", "exec", "-s", session,
+                              "--timeout", timeout, "-f", f.name],
+                             stdout=subprocess.PIPE, text=True)
+        rc = 1
+        for line in p.stdout:
+            if line.startswith(RC_MARK):
+                rc = int(line[len(RC_MARK):])
+            else:
+                sys.stdout.write(line)
+        if p.wait() != 0:
+            rc = p.returncode
+    finally:
+        os.unlink(f.name)
+    if check and rc != 0:
+        die(f"remote step failed (exit {rc})", rc)
+    return rc
+
+
+def download_text(session, remote):
+    """Return the remote file's text, or None if it does not exist."""
+    with tempfile.TemporaryDirectory() as d:
+        local = os.path.join(d, "f")
+        r = colab("download", "-s", session, remote, local, capture=True, check=False)
+        if r.returncode != 0:
+            if "not found" in (r.stdout + r.stderr).lower():
+                return None
+            sys.stderr.write(r.stdout + r.stderr)
+            die("download failed (session gone? try `cgpu ls`)", 3)
+        return Path(local).read_text(errors="replace")
+
+
+def job_file(session):
+    return STATE_DIR / f"{session}.json"
+
+
+def current_job(session):
+    p = job_file(session)
+    if not p.exists():
+        die(f"no job recorded for session '{session}' (start one with `cgpu start`)")
+    return json.loads(p.read_text())
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_up(a):
+    gpu = a.gpu.upper()
+    args = ["new", "-s", a.session]
+    if gpu != "CPU":
+        # colab-cli maps an unknown --gpu value to A100 silently; refuse instead.
+        if gpu not in GPUS:
+            die(f"unknown GPU '{a.gpu}'; choose from {sorted(GPUS)} or cpu")
+        args += ["--gpu", gpu]
+    if a.high_mem:
+        args.append("--high-mem")
+    r = colab(*args, capture=True, check=False)
+    print(r.stdout, end="")
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        die(f"could not allocate {gpu}; it may be unavailable right now or not "
+            "in this plan. Ask the user before trying a different GPU.", r.returncode)
+    exec_py(a.session, "import subprocess\nprint(subprocess.run(['nvidia-smi',"
+            "'--query-gpu=name,memory.total','--format=csv,noheader'],"
+            "capture_output=True,text=True).stdout or 'no GPU')", timeout="120")
+    colab("usage")
+
+
+def cmd_push(a):
+    src = Path(a.local).expanduser().resolve()
+    if not src.exists():
+        die(f"{src} does not exist")
+    dest = a.remote or f"/content/{src.name}"
+    if src.is_file():
+        upload(a.session, src, dest)
+        return
+    with tempfile.TemporaryDirectory() as d:
+        tgz = Path(d) / "push.tgz"
+        with tarfile.open(tgz, "w:gz") as t:
+            t.add(src, arcname=".", filter=lambda ti: None if Path(ti.name).name
+                  in TAR_EXCLUDES or ti.name.endswith(".pyc") else ti)
+        remote_tgz = f"/tmp/cgpu-push-{uuid.uuid4().hex[:8]}.tgz"
+        upload(a.session, tgz, remote_tgz)
+    exec_py(a.session, f"import os,tarfile\nos.makedirs({dest!r},exist_ok=True)\n"
+            f"tarfile.open({remote_tgz!r}).extractall({dest!r},filter='fully_trusted')\n"
+            f"os.remove({remote_tgz!r})\nprint('extracted to', {dest!r})")
+
+
+def upload(session, local, remote):
+    """`colab upload`, split into parts: the runtime proxy drops uploads
+    somewhere between 50 and 100 MB (downloads have no such limit)."""
+    size = local.stat().st_size
+    print(f"[cgpu] uploading {local.name} ({size / 1e6:.1f} MB, ~7 MB/s) -> {remote}")
+    if size <= CHUNK:
+        colab("upload", "-s", session, str(local), remote, capture=True)
+        return
+    parts = []
+    with open(local, "rb") as f, tempfile.TemporaryDirectory() as d:
+        while chunk := f.read(CHUNK):
+            part = Path(d) / "part"
+            part.write_bytes(chunk)
+            rpart = f"/tmp/cgpu-part-{uuid.uuid4().hex[:8]}"
+            colab("upload", "-s", session, str(part), rpart, capture=True)
+            parts.append(rpart)
+            print(f"[cgpu]   {f.tell() / 1e6:.0f}/{size / 1e6:.0f} MB")
+    exec_py(session, f"import os\nos.makedirs(os.path.dirname({remote!r}) or '.',"
+            f"exist_ok=True)\nwith open({remote!r},'wb') as out:\n"
+            f"    for p in {parts!r}:\n        out.write(open(p,'rb').read()); os.remove(p)")
+
+
+def cmd_secrets(a):
+    which = a.which or ["kaggle", "hf"]
+    files = {"kaggle": (Path.home() / ".kaggle/kaggle.json", "/root/.kaggle/kaggle.json"),
+             "hf": (Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface"))
+                    / "token", "/root/.cache/huggingface/token")}
+    # Upload as files rather than `colab exec --env`: --env puts the value in
+    # the local argv and in colab-cli's local history log.
+    moves = []
+    for w in which:
+        if w not in files:
+            die(f"unknown secret '{w}' (kaggle, hf)")
+        local, remote = files[w]
+        if not local.exists():
+            die(f"{local} not found")
+        tmp = f"/tmp/cgpu-secret-{uuid.uuid4().hex[:8]}"
+        colab("upload", "-s", a.session, str(local), tmp, capture=True)
+        moves.append((tmp, remote))
+    exec_py(a.session, "import os,shutil\n" + "".join(
+        f"os.makedirs(os.path.dirname({r!r}),exist_ok=True)\n"
+        f"shutil.move({t!r},{r!r})\nos.chmod({r!r},0o600)\nprint('installed',{r!r})\n"
+        for t, r in moves), timeout="120")
+
+
+def cmd_start(a):
+    command = " ".join(a.cmd).strip()
+    if not command:
+        die("usage: cgpu start SESSION [--cwd DIR] -- CMD")
+    jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
+    jdir = f"{REMOTE_ROOT}/{jid}"
+    cell = f"""
+import os, subprocess, time
+os.makedirs({jdir!r}, exist_ok=True)
+with open({jdir + '/log'!r}, 'wb') as log:
+    p = subprocess.Popen({command!r}, shell=True, cwd={a.cwd!r}, stdout=log,
+                         stderr=subprocess.STDOUT, start_new_session=True,
+                         env={{**os.environ, 'PYTHONUNBUFFERED': '1'}})
+    open({jdir + '/pid'!r}, 'w').write(str(p.pid))
+    rc = p.wait()
+open({jdir + '/rc'!r}, 'w').write(str(rc))
+"""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+        f.write(cell)
+    client_log = STATE_DIR / f"{a.session}-{jid}.client.log"
+    with open(client_log, "w") as out:
+        client = subprocess.Popen(
+            ["colab", f"--auth={AUTH}", "exec", "-s", a.session,
+             "--timeout", LONG, "-f", f.name],
+            stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    job_file(a.session).write_text(json.dumps(
+        {"id": jid, "dir": jdir, "cmd": command, "cwd": a.cwd,
+         "started": time.time()}))
+    try:
+        for _ in range(90):  # wait for the pid file: proves the job is running
+            if client.poll() is not None:
+                die(f"exec client exited early (exit {client.returncode}); "
+                    f"see {client_log}. Is the kernel busy with another job?")
+            if download_text(a.session, jdir + "/pid") is not None:
+                break
+            time.sleep(2)
+        else:
+            client.terminate()
+            die(f"job did not start within 3 min; see {client_log}")
+    finally:
+        os.unlink(f.name)
+    client.terminate()  # the kernel cell keeps running without us
+    print(f"[cgpu] job {jid} running on '{a.session}': {command}")
+    print(f"[cgpu] follow with: cgpu logs {a.session}   |   cgpu wait {a.session}")
+
+
+def cmd_logs(a):
+    job = current_job(a.session)
+    text = download_text(a.session, job["dir"] + "/log")
+    if text is None:
+        die("no log yet")
+    lines = text.replace("\r", "\n").splitlines()  # tqdm writes \r
+    print("\n".join(lines[-a.n:]))
+    rc = download_text(a.session, job["dir"] + "/rc")
+    mins = (time.time() - job["started"]) / 60
+    print(f"[cgpu] job {job['id']}: " + (f"FINISHED exit={rc.strip()}" if rc
+          else f"running ({mins:.0f} min)"), file=sys.stderr)
+
+
+def cmd_wait(a):
+    job = current_job(a.session)
+    while True:
+        rc = download_text(a.session, job["dir"] + "/rc")
+        if rc is not None:
+            a.n = 40
+            cmd_logs(a)
+            rc = int(rc.strip())
+            sys.exit(128 - rc if rc < 0 else rc)  # killed by signal N -> 128+N
+        time.sleep(a.poll)
+
+
+def cmd_kill(a):
+    job = current_job(a.session)
+    pid = download_text(a.session, job["dir"] + "/pid")
+    if pid is None:
+        die("job has no pid file yet")
+    # The kernel is busy running the job cell, so go through the terminal.
+    colab("console", "-s", a.session, stdin=f"kill -TERM -{pid.strip()}\n",
+          capture=True, timeout=60)
+    print(f"[cgpu] sent SIGTERM to process group {pid.strip()}")
+
+
+def cmd_pull(a):
+    local = Path(a.local).expanduser()
+    tgz = f"/tmp/cgpu-pull-{uuid.uuid4().hex[:8]}.tgz"
+    r = colab("download", "-s", a.session, a.remote, str(local), capture=True, check=False)
+    if r.returncode == 0:
+        print(r.stdout.strip())
+        return
+    # Probably a directory: tar it on the VM (needs an idle kernel).
+    exec_py(a.session, f"import os,tarfile\nassert os.path.isdir({a.remote!r}), "
+            f"'no such file or dir: ' + {a.remote!r}\n"
+            f"with tarfile.open({tgz!r},'w:gz') as t: t.add({a.remote!r},arcname='.')\n"
+            f"print('packed', os.path.getsize({tgz!r})//10**6, 'MB')")
+    with tempfile.TemporaryDirectory() as d:
+        colab("download", "-s", a.session, tgz, f"{d}/pull.tgz", capture=True)
+        local.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(f"{d}/pull.tgz") as t:
+            t.extractall(local, filter="data")
+    colab("rm", "-s", a.session, tgz, capture=True, check=False)
+    print(f"[cgpu] {a.remote} -> {local}")
+
+
+def cmd_sh(a):
+    command = " ".join(a.cmd).strip()
+    if not command:
+        die("usage: cgpu sh SESSION [--timeout SECS] -- CMD")
+    # A child's raw stdout bypasses the kernel's iopub stream, so capture it.
+    sys.exit(exec_py(a.session, "import subprocess\nr = subprocess.run("
+                     f"{command!r}, shell=True, capture_output=True, text=True)\n"
+                     "print(r.stdout + r.stderr, end='')\n_cgpu_rc = r.returncode",
+                     timeout=str(a.timeout), check=False))
+
+
+def cmd_down(a):
+    colab("stop", "-s", a.session)
+    job_file(a.session).unlink(missing_ok=True)
+    colab("usage")
+
+
+def cmd_ls(a):
+    colab("sessions")
+    colab("usage")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="cgpu", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="c", required=True)
+    s = sub.add_parser("up"); s.add_argument("session"); s.add_argument("gpu")
+    s.add_argument("--high-mem", action="store_true"); s.set_defaults(f=cmd_up)
+    s = sub.add_parser("push"); s.add_argument("session"); s.add_argument("local")
+    s.add_argument("remote", nargs="?"); s.set_defaults(f=cmd_push)
+    s = sub.add_parser("secrets"); s.add_argument("session")
+    s.add_argument("which", nargs="*"); s.set_defaults(f=cmd_secrets)
+    s = sub.add_parser("start"); s.add_argument("session")
+    s.add_argument("--cwd", default="/content"); s.set_defaults(f=cmd_start)
+    s = sub.add_parser("logs"); s.add_argument("session")
+    s.add_argument("-n", type=int, default=40); s.set_defaults(f=cmd_logs)
+    s = sub.add_parser("wait"); s.add_argument("session")
+    s.add_argument("--poll", type=int, default=60); s.set_defaults(f=cmd_wait)
+    s = sub.add_parser("kill"); s.add_argument("session"); s.set_defaults(f=cmd_kill)
+    s = sub.add_parser("pull"); s.add_argument("session"); s.add_argument("remote")
+    s.add_argument("local"); s.set_defaults(f=cmd_pull)
+    s = sub.add_parser("sh"); s.add_argument("session")
+    s.add_argument("--timeout", type=int, default=600); s.set_defaults(f=cmd_sh)
+    s = sub.add_parser("down"); s.add_argument("session"); s.set_defaults(f=cmd_down)
+    s = sub.add_parser("ls"); s.set_defaults(f=cmd_ls)
+    argv = sys.argv[1:]
+    cmd = []
+    if "--" in argv:  # everything after `--` is the remote command, verbatim
+        i = argv.index("--")
+        argv, cmd = argv[:i], argv[i + 1:]
+    a = p.parse_args(argv)
+    a.cmd = cmd
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()
