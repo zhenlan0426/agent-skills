@@ -19,8 +19,10 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
 - `cgpu ls` shows live sessions and the compute-unit balance. If it errors with
   401/403 or a missing token, ask the user to run
   `! colab --auth=oauth2 sessions` and paste the code (a one-time browser
-  consent). Don't try to fix auth any other way. If `colab` isn't installed,
-  run `uv tool install google-colab-cli`.
+  consent). Don't try to fix auth any other way. `cgpu` was verified against
+  colab-cli 0.7.4 and depends on its exact messages. If `colab` isn't installed,
+  run `uv tool install google-colab-cli==0.7.4`. If `colab --version` reports a
+  different version, tell the user: the workarounds below may no longer hold.
 - **Pick the GPU with the user** unless they named one. The local 4090 has 24GB:
   T4 (16GB) and L4 (24GB) are slower than the 4090 and only make sense for
   parallel work. For more VRAM or speed, choose A100, H100, or G4. `cgpu up`
@@ -41,25 +43,43 @@ cgpu start job1 --cwd /content/myproj -- python train.py --epochs 3
 cgpu logs job1 -n 50                           # any time; also says running/FINISHED
 cgpu wait job1                                 # blocks; exits with the job's exit code
 cgpu pull job1 /content/myproj/out ./out       # file or directory
-cgpu down job1                                 # ALWAYS, including after failures
+cgpu down job1                                 # always, once results are safe (below)
 ```
 
+- **Commands are argv, not shell strings.** Arguments after `--` reach the VM
+  exactly as quoted locally. For pipes, globs, `&&`, or `cd`, invoke a shell:
+  `cgpu sh job1 -- bash -c 'nvidia-smi | head -5'`.
+
 - **Long jobs:** `start` returns once the job is running. Don't block a turn on
-  `wait` for longer than your tool timeout. In Claude Code, run `cgpu wait` with
-  `run_in_background` so you get a notification. Otherwise poll with `cgpu logs`
-  every few minutes. `cgpu kill` stops the job but keeps the VM.
-- **One job at a time per session.** The job occupies the kernel, so `sh`,
-  directory `pull`, and `push` of a directory all wait behind it. `logs`, `kill`,
-  and single-file `pull` still work mid-job. Use a second session for parallel
-  work.
+  `wait` for longer than your tool timeout. `cgpu wait --timeout SECS` gives up
+  after SECS with exit 124 and leaves the job running. In Claude Code, run
+  `cgpu wait` with `run_in_background` so you get a notification. Otherwise
+  poll with `cgpu logs` every few minutes. `logs` reads a 256KB tail the VM
+  keeps up to date (about every 2s), so polling stays cheap for verbose jobs.
+  Use `--full` or a large `-n` to fetch the whole log. `cgpu kill` stops the
+  job but keeps the VM.
+- **One job at a time per session.** `start` refuses while the session's
+  previous job is still running. The job occupies the kernel, so `sh`, directory
+  `pull`, and `push` of a directory all wait behind it. `logs`, `kill`, and
+  single-file `pull` still work mid-job. Use a second session for parallel work.
 - **Data:** local files go through `push`, which chunks uploads at about 7MB/s
   (a few GB is fine, much more is slow). For Kaggle and Hugging Face data,
   download on the VM: `cgpu secrets` installs `~/.kaggle/kaggle.json` and the HF
   token there, then use the `kaggle` CLI or `huggingface_hub` inside the job.
   `colab drivemount` needs a human at the keyboard, so don't use it.
-- **Write outputs under `/content/...`** and checkpoint periodically. The VM is
-  ephemeral, and nothing survives `down` or a backend reclaim. Pull what matters
-  before `down`.
+- **Outputs and checkpoints.** Write outputs under `/content/...`. Everything
+  there is lost with the VM, whether through `down` or a backend reclaim.
+  Periodic saves on the VM protect against the job crashing but not against
+  losing the VM. For a job the user can't afford to lose, get checkpoints off
+  the VM while it runs:
+  - Have the job upload each checkpoint itself, for example with
+    `huggingface_hub.upload_file` to a private repo (after `cgpu secrets job1
+    hf`). This works even when no one is watching.
+  - Or, while polling, copy the newest checkpoint home with a single-file
+    `cgpu pull job1 /content/myproj/ckpt/last.pt ./ckpt/`. This works mid-job.
+    Have the job write it under a temporary name and rename it into place, so
+    a pull never catches half a file.
+  Decide which of these to use with the user before starting a multi-hour job.
 - The VM image ships Python 3.13 and a recent CUDA PyTorch. Check `cgpu sh job1
   -- pip list` before installing heavy packages.
 
@@ -78,15 +98,25 @@ cgpu down job1                                 # ALWAYS, including after failure
 - `colab exec --env` leaks values into the local argv and history, so `cgpu
   secrets` uploads files instead.
 - Unverified: how long a Pro VM stays alive with a busy kernel and no client
-  attached (a ~90-second test held). For multi-hour jobs, checkpoint and check
-  `cgpu logs`. If the session disappears (`cgpu ls`), tell the user and don't
-  quietly re-run.
+  attached (a ~90-second test held). For multi-hour jobs, keep checkpoints off
+  the VM (see above) and check `cgpu logs`. `cgpu` reports a lost session
+  explicitly ("session '…' is gone"). If that happens, tell the user what was
+  lost and don't quietly re-run.
 
 ## If something breaks
 
 - `cgpu logs` shows the job's own output. The detached client's output is in
   `~/.cache/cgpu/<session>-<job>.client.log`.
 - If the kernel is wedged, run `colab --auth=oauth2 restart-kernel -s <name>`
-  (keeps the VM). If the session is gone, recreate it with `cgpu up`.
+  (keeps the VM). If the session is gone, recreate it with `cgpu up` and resume
+  from the last off-VM checkpoint, but **only after the user authorizes it**.
+  A rerun spends compute units again.
+- If `pull` fails, don't `down` yet: that would destroy the only copy. Check
+  that the session is still alive (`cgpu ls`), then retry. Pull a directory
+  that is too large for one download in smaller pieces, as single files, or
+  after packing it with `cgpu sh job1 -- tar czf /content/out.tgz -C
+  /content/myproj out`. The VM costs money meanwhile. If the results still
+  can't be retrieved, tell the user and let them choose between more attempts
+  and `down`.
 - Orphaned VMs cost money. `cgpu ls` lists every server-side session, and
   `colab --auth=oauth2 stop -s <name>` stops one.
