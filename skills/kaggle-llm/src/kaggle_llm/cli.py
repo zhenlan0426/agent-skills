@@ -4,7 +4,7 @@ import math
 from pathlib import Path
 import sys
 
-from . import Client, KaggleLLMError
+from . import Client, KaggleLLMError, best
 from .client import _prepare_schema
 from .jsonutil import loads
 
@@ -17,7 +17,8 @@ def emit(value):
 
 
 def _options(parser):
-    parser.add_argument('--model', help='Exact provider/model ID (including unlisted models), or a known bare slug')
+    parser.add_argument('--model', help='Exact provider/model ID (including unlisted models) or a known bare slug; '
+                        'default: the model chosen by `kaggle-llm best`')
     parser.add_argument('--system')
     parser.add_argument('--schema', type=Path, help='JSON Schema file; validated locally')
     parser.add_argument('--schema-mode', choices=['prompt', 'native'], default='prompt')
@@ -32,7 +33,9 @@ def main(argv=None):
     parser.add_argument('--timeout', type=float, default=120, help='HTTP timeout in seconds (default 120)')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('auth', help='Refresh protected credentials and local model catalog')
-    sub.add_parser('models', help='Show the curated local model list and default (not exhaustive; JSON)')
+    sub.add_parser('models', help='Show the curated local model list (not exhaustive; JSON)')
+    best_parser = sub.add_parser('best', help='Show the preferred callable model (cached 24h; probes on refresh)')
+    best_parser.add_argument('--refresh', action='store_true', help='Ignore the cache and re-probe')
     prompt = sub.add_parser('prompt', help='Single call; JSON envelope on stdout by default')
     source = prompt.add_mutually_exclusive_group(required=True)
     source.add_argument('-p', '--prompt')
@@ -62,6 +65,12 @@ def main(argv=None):
             if args.command in ('auth', 'models'):
                 emit(client.credentials.status(refresh=args.command == 'auth'))
                 return 0
+            if args.command == 'best':
+                emit(best.select(client, refresh=args.refresh))
+                return 0
+            if args.model is None:
+                # Resolve once so every row of a batch uses the same model.
+                args.model = client.best_model()
             options = {key: getattr(args, key) for key in (
                 'model', 'system', 'schema_mode', 'max_tokens', 'temperature', 'reasoning')}
             options['schema'] = schema

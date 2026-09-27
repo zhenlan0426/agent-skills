@@ -27,7 +27,7 @@ uv run --with /path/to/kaggle-llm python script.py
 from kaggle_llm import Client, KaggleLLMError
 
 with Client(timeout=120) as llm:
-    print(llm.models())
+    print(llm.best_model())  # model used whenever model= is omitted
     result = llm.prompt("What is 2 + 2?", max_tokens=128)
     print(result["text"], result["usage"])
 
@@ -57,7 +57,9 @@ with Client(timeout=120) as llm:
 
 Schema output is parsed and validated locally with `jsonschema`. Same-document references are allowed; external references are rejected to keep validation offline. Format annotations are not checked. Prompt mode works across more providers; native mode sends a strict JSON Schema response format that unsupported models or schema shapes can reject. There is no hidden fallback or repair call.
 
-The list comes from `kaggle b init`, whose CLI supplies curated IDs. It is neither exhaustive nor live-verified. Exact `provider/model` IDs are forwarded unchanged even when absent; bare aliases resolve only against the configured list, and fail if it is empty or the match is ambiguous. For a listed `anthropic/claude-sonnet-5@default`, aliases include `claude-sonnet-5`, `claude-sonnet-5@default`, and `claude-sonnet-5-default`. Obtain exact IDs from benchmark model metadata (`version.model_proxy_slug`) where possible. The proxy still enforces account access. Refreshing credentials does not discover all newly callable models. The full `kaggle b t models` benchmark catalog is also not proof of local access.
+With `model=None` (CLI: no `--model`), calls use `best_model()`. Selection ranks the Kaggle benchmark catalog (`ListBenchmarkModels`, versions with `allow_model_proxy` and a `model_proxy_slug`) plus `LLMS_AVAILABLE`, then probes candidates in rank order with a 256-token "Reply with OK." prompt. 400/403/404 mark a candidate unavailable and continue; any other failure (429, 5xx, timeout, refresh failure) aborts selection without caching. If the catalog is unreachable, only `LLMS_AVAILABLE` is ranked and the result says so in `catalog_source`. The pick, the unavailable list, and the untried candidates are cached for 24 hours in `<credential file>.model.json`. `kaggle-llm best --refresh` re-probes. The successful probe consumes a little inference quota.
+
+`kaggle-llm models` shows `LLMS_AVAILABLE`, which comes from `kaggle b init`, whose CLI hard-codes curated IDs. It is neither exhaustive nor live-verified. Exact `provider/model` IDs are forwarded unchanged even when absent; bare aliases resolve only against the configured list, and fail if it is empty or the match is ambiguous. For a listed `anthropic/claude-sonnet-5@default`, aliases include `claude-sonnet-5`, `claude-sonnet-5@default`, and `claude-sonnet-5-default`. Obtain exact IDs from benchmark model metadata (`version.model_proxy_slug`) where possible. The proxy still enforces account access. Refreshing credentials does not discover all newly callable models. The full `kaggle b t models` benchmark catalog is also not proof of local access.
 
 To check current account access, obtain an exact ID from the catalog or benchmark metadata and send one small prompt. Allow enough output tokens for models that spend tokens on reasoning:
 
@@ -78,7 +80,7 @@ kaggle-llm --env-file /private/path/proxy.env models
 kaggle-llm prompt -p 'Reply with OK.'
 ```
 
-An alternate credential file can be set with `KAGGLE_LLM_ENV_FILE`. The caller's `.env` and ambient `MODEL_PROXY_*` values are intentionally not loaded, preventing stale environment values shadowing refreshed credentials. Custom files require `MODEL_PROXY_URL` and `MODEL_PROXY_API_KEY`; `LLM_DEFAULT`, `LLMS_AVAILABLE`, and `MODEL_PROXY_EXPIRY_TIME` are recommended.
+An alternate credential file can be set with `KAGGLE_LLM_ENV_FILE`. The caller's `.env` and ambient `MODEL_PROXY_*` values are intentionally not loaded, preventing stale environment values shadowing refreshed credentials. Custom files require `MODEL_PROXY_URL` and `MODEL_PROXY_API_KEY`; `LLMS_AVAILABLE` and `MODEL_PROXY_EXPIRY_TIME` are recommended. `LLM_DEFAULT` is ignored; the default model is `best_model()`.
 
 Both `--env-file` and `KAGGLE_LLM_ENV_FILE` select a writable, managed credential file. Missing or expired credentials, a 401, or an explicit `auth` command trigger `kaggle b init` using the current Kaggle login. A successful refresh atomically replaces the entire selected file with Kaggle's output, including the endpoint and model catalog, with mode 0600. Use a dedicated file; unrelated keys and custom endpoint/token values are not preserved. Refresh subprocesses cannot read batch stdin.
 

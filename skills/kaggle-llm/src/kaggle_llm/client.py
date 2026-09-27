@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 import httpx
 import jsonschema
 
+from . import best
 from .auth import Credentials, KaggleLLMError
 from .jsonutil import loads
 
@@ -17,9 +18,8 @@ def _slug(model):
 
 
 def resolve_model(model, values):
-    model = model or values.get("LLM_DEFAULT")
     if not isinstance(model, str) or not model.strip():
-        raise KaggleLLMError("No model configured; provide model= or run kaggle-llm auth.", batch_fatal=True)
+        raise KaggleLLMError("No model given; pass model= or leave it None for best_model().", batch_fatal=True)
     if "/" in model:
         # The CLI's curated list can lag actual proxy access. Exact IDs are
         # forwarded unchanged; Kaggle remains the authority on availability.
@@ -105,12 +105,17 @@ class Client:
     def models(self):
         return self.credentials.status()
 
+    def best_model(self, *, refresh=False):
+        """Preferred callable model: Claude = OpenAI > Gemini, newest first. Cached 24h."""
+        return best.select(self, refresh=refresh)["model"]
+
     def chat(self, messages, *, model=None, max_tokens=None, temperature=None,
              reasoning=None, response_format=None):
         """Return a raw Chat Completions dict. Text messages only; no streaming.
 
-        401 refreshes once. 403, 429, 5xx and timeouts are surfaced without retry,
-        avoiding accidental duplicate work and hidden quota spending.
+        model=None uses best_model(). 401 refreshes once. 403, 429, 5xx and timeouts
+        are surfaced without retry, avoiding accidental duplicate work and hidden
+        quota spending.
         """
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a nonempty list")
@@ -126,6 +131,8 @@ class Client:
             raise ValueError("temperature must be between 0 and 2")
         if reasoning is not None and reasoning not in ("none", "minimal", "low", "medium", "high"):
             raise ValueError("Unsupported reasoning effort")
+        if model is None:
+            model = self.best_model()
         payload = {"messages": messages, "stream": False}
         for key, value in (("max_tokens", max_tokens), ("temperature", temperature),
                            ("reasoning_effort", reasoning), ("response_format", response_format)):
@@ -164,7 +171,9 @@ class Client:
                     429: "Quota or rate limit reached. Wait before trying again.",
                 }
                 hint = hints.get(response.status_code, "Proxy request failed; no automatic retry.")
-                raise KaggleLLMError(f"HTTP {response.status_code}: {hint}",
+                if response.status_code in (403, 404):
+                    best.forget_if(self.credentials, payload["model"])  # Reselect on the next call.
+                raise KaggleLLMError(f"HTTP {response.status_code}: {hint}", status=response.status_code,
                                      batch_fatal=response.status_code in (401, 403, 404, 429),
                                      batch_transient=500 <= response.status_code < 600)
             try:

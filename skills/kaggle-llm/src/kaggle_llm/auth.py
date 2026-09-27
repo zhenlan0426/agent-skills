@@ -14,10 +14,11 @@ from dotenv import dotenv_values
 class KaggleLLMError(RuntimeError):
     """A safe-to-display failure; excludes credentials and upstream request bodies."""
 
-    def __init__(self, message, *, batch_fatal=False, batch_transient=False):
+    def __init__(self, message, *, batch_fatal=False, batch_transient=False, status=None):
         super().__init__(message)
         self.batch_fatal = batch_fatal
         self.batch_transient = batch_transient
+        self.status = status
 
 
 def default_env_file():
@@ -94,7 +95,6 @@ class Credentials:
         return {
             "env_file": str(self.path),
             "expires_at": values.get("MODEL_PROXY_EXPIRY_TIME"),
-            "default_model": values.get("LLM_DEFAULT"),
             "models": [s.strip() for s in (values.get("LLMS_AVAILABLE") or "").split(",") if s.strip()],
             "models_source": "Kaggle CLI curated LLMS_AVAILABLE; not exhaustive or live-verified",
             "note": "Exact provider/model IDs can be called even if unlisted; the proxy decides access.",

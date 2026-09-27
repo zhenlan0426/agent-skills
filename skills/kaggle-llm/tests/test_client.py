@@ -4,11 +4,13 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import httpx
 
 from kaggle_llm import Client, KaggleLLMError
+from kaggle_llm import best
 from kaggle_llm.auth import Credentials
 from kaggle_llm.cli import main
 from kaggle_llm.client import _endpoint, resolve_model
@@ -38,6 +40,11 @@ class ClientTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / 'credentials.env'
         self.path.write_text(ENV)
         self.requests = []
+        self.cache_model('google/test')
+
+    def cache_model(self, model, age=timedelta(0)):
+        best.cache_path(Credentials(self.path)).write_text(json.dumps({
+            'model': model, 'selected_at': (datetime.now(timezone.utc) - age).isoformat()}))
 
     def client(self, responder):
         def handler(request):
@@ -205,6 +212,7 @@ class ClientTests(unittest.TestCase):
         for status, count in [(403, 1), (404, 1), (429, 1), (401, 2)]:
             with self.subTest(status=status):
                 self.requests.clear()
+                self.cache_model('google/test')  # A 403/404 drops the cached pick.
                 c = self.client(lambda r: httpx.Response(status))
                 with patch.object(c.credentials, 'ensure', return_value=c.credentials.read()) as ensure:
                     code, rows, err = self.run_batch(c)
@@ -249,7 +257,6 @@ class ClientTests(unittest.TestCase):
     def test_batch_stops_on_invalid_local_configuration(self):
         for env, model in (
             (ENV, 'unknown'), (ENV, 'bad/model/id'),
-            (ENV.replace('LLM_DEFAULT=google/test', 'LLM_DEFAULT='), None),
             (ENV.replace('https://proxy.example/models', 'http://proxy.example'), None),
             (ENV.replace('https://proxy.example/models', 'https://proxy.example:bad'), None),
             (ENV.replace('https://proxy.example/models', 'https://[broken'), None),
@@ -427,6 +434,67 @@ class ClientTests(unittest.TestCase):
                 )))
                 with self.assertRaisesRegex(KaggleLLMError, 'Proxy returned invalid JSON'):
                     c.prompt('hello')
+
+    def test_rank_prefers_claude_openai_then_gemini_newest_first(self):
+        slugs = ['google/gemini-3.8-flash', 'google/gemini-3.1-pro-preview', 'google/gemini-3.5-flash-lite',
+                 'anthropic/claude-sonnet-5@default', 'anthropic/claude-opus-4-8@default',
+                 'anthropic/claude-opus-5@default', 'anthropic/claude-haiku-4-5@20251001',
+                 'openai/gpt-5.4-nano-2026-03-17', 'openai/gpt-5.5-2026-04-23', 'openai/gpt-6-astra',
+                 'openai/gpt-oss-120b', 'qwen/qwen3-next-80b-a3b-instruct', 'google/gemma-4-31b']
+        self.assertEqual(best.rank(slugs), [
+            'openai/gpt-6-astra', 'openai/gpt-5.5-2026-04-23', 'anthropic/claude-opus-5@default',
+            'anthropic/claude-sonnet-5@default', 'openai/gpt-5.4-nano-2026-03-17',
+            'anthropic/claude-opus-4-8@default', 'anthropic/claude-haiku-4-5@20251001',
+            'google/gemini-3.1-pro-preview', 'google/gemini-3.8-flash', 'google/gemini-3.5-flash-lite',
+        ])
+
+    def test_default_model_is_cached_pick(self):
+        self.cache_model('anthropic/claude-sonnet-5@default')
+        c = self.client(lambda r: completion())
+        with patch('kaggle_llm.best.fetch_catalog') as catalog:
+            c.prompt('hello')
+        catalog.assert_not_called()
+        self.assertEqual(json.loads(self.requests[0].content)['model'], 'anthropic/claude-sonnet-5@default')
+
+    def test_selection_probes_in_rank_order_and_caches(self):
+        self.cache_model('google/test', age=timedelta(days=2))
+        available = {'anthropic/claude-sonnet-5@default', 'google/gemini-3.7-flash'}
+        c = self.client(lambda r: completion() if json.loads(r.content)['model'] in available
+                        else httpx.Response(404))
+        catalog = ['anthropic/claude-opus-5@default', 'anthropic/claude-sonnet-5@default',
+                   'google/gemini-3.7-flash', 'openai/gpt-oss-120b']
+        with patch('kaggle_llm.best.fetch_catalog', return_value=catalog):
+            self.assertEqual(c.best_model(), 'anthropic/claude-sonnet-5@default')
+            self.assertEqual(c.best_model(), 'anthropic/claude-sonnet-5@default')
+        probed = [json.loads(r.content)['model'] for r in self.requests]
+        self.assertEqual(probed, ['anthropic/claude-opus-5@default', 'anthropic/claude-sonnet-5@default'])
+        cached = best.read_cache(c.credentials)
+        self.assertEqual(cached['unavailable'], ['anthropic/claude-opus-5@default'])
+        # LLMS_AVAILABLE's anthropic/other has no version, so it is not a candidate.
+        self.assertEqual(cached['untried'], ['google/gemini-3.7-flash'])
+
+    def test_selection_stops_on_quota_and_rejected_pick_is_forgotten(self):
+        self.cache_model('google/test', age=timedelta(days=2))
+        c = self.client(lambda r: httpx.Response(429))
+        with patch('kaggle_llm.best.fetch_catalog', return_value=['anthropic/claude-opus-5@default',
+                                                                  'anthropic/claude-sonnet-5@default']), \
+                self.assertRaises(KaggleLLMError) as caught:
+            c.best_model()
+        self.assertEqual(caught.exception.status, 429)
+        self.assertEqual(len(self.requests), 1)
+        self.cache_model('google/gemini-3.7-flash')
+        c = self.client(lambda r: httpx.Response(404))
+        with self.assertRaises(KaggleLLMError):
+            c.prompt('hello')
+        self.assertIsNone(best.read_cache(c.credentials))
+
+    def test_cli_batch_pins_one_model(self):
+        c = self.client(lambda r: completion())
+        with patch.object(c, 'best_model', return_value='google/test') as pick:
+            code, rows, _ = self.run_batch(c)
+        self.assertEqual(code, 0)
+        pick.assert_called_once()
+        self.assertEqual({json.loads(r.content)['model'] for r in self.requests}, {'google/test'})
 
 
 if __name__ == '__main__':
