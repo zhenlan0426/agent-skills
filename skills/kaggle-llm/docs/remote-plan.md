@@ -632,6 +632,19 @@ notebooks were 12-13 KB. `Public: False` was confirmed after every push.
 - Behavior worth a decision: in the kernel, a 403 fails only that row, and
   dispatch continues, so a revoked or exhausted token still tries every row.
   Local `batch` treats 403 as batch-fatal and stops. Not changed.
+- Retry at the user's request ("it may be a network thing"): the same command
+  unchanged, job `5cc4d583bfa5`, version 7, pushed 20:02:23Z, finished
+  20:03:34Z, `Public: False`. **Same result:** 1 row ok, 46 rows `HTTP 403`
+  on the first attempt, `cost_usd` 0.00426, exit 1.
+- The succeeding row differs between runs (line 5, then line 6), so the prompt
+  content is not the cause. In both runs the 403 rows were written first and
+  the single ok row last: about 1 of 8 concurrent requests is admitted and the
+  rest are rejected at once.
+- Difference from E3/E4, which had no 403s at concurrency 8: those set
+  `max_tokens` (512/256); step 1 sends none. Hypothesis (untested): the proxy
+  reserves spend per request against the request's maximum output, which is
+  huge without `max_tokens`, and rejects requests over a budget with 403. The
+  probe (`max_tokens` 256) always passes. Stopped again pending the user.
 
 ## 7. Acceptance (Phase 5)
 
