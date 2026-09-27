@@ -22,12 +22,15 @@ Usage:
   cgpu wait SESSION [--poll S] [--timeout S]  block until the job ends; exits with
                                           its code, or 124 if --timeout runs out
   cgpu kill SESSION                       SIGTERM the job's process group
-  cgpu pull SESSION REMOTE LOCAL          file or dir (dirs are tarred on the VM)
+  cgpu pull SESSION REMOTE LOCAL          file: to LOCAL, or into it if LOCAL is a dir
+                                          or ends in /; dir: its contents into LOCAL
   cgpu sh SESSION -- CMD                  run a short command (kernel must be idle)
   cgpu down SESSION                       stop the VM and print the compute-unit balance
   cgpu ls                                 sessions + compute-unit usage
 
-Env: CGPU_AUTH (default oauth2) is passed as `colab --auth=...`.
+Env: CGPU_AUTH (default oauth2) is passed as `colab --auth=...`;
+     CGPU_START_WAIT (default 180) is how long `start` waits for the job to leave
+     the kernel's queue.
 """
 import argparse
 import fcntl
@@ -41,7 +44,7 @@ import tempfile
 import time
 import uuid
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 print = partial(print, flush=True)  # keep ordering with colab's own output
 
@@ -58,6 +61,10 @@ CHUNK = 40 * 1000 * 1000
 # The job wrapper keeps the log's last TAIL_BYTES in a side file, so `logs`
 # doesn't download a multi-GB log to show 40 lines of it.
 TAIL_BYTES = 256 * 1024
+# The job cell refreshes a heartbeat every 2s. One this old (by the local clock)
+# means the cell is gone without writing status.json: kernel restarted or died.
+BEAT_STALE = 180
+START_WAIT = int(os.environ.get("CGPU_START_WAIT", 180))
 
 
 def die(msg, code=1):
@@ -85,6 +92,7 @@ def exec_py(session, code, timeout="600", check=True):
     end in a newline, so the marker is looked for anywhere in a line. Kernel
     must be idle.
     """
+    require_idle(session, "this step")
     mark = f"__CGPU_RC_{uuid.uuid4().hex}__="
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(f"_cgpu_rc = 0\n{code}\nprint({mark!r} + str(_cgpu_rc))\n")
@@ -110,35 +118,77 @@ def exec_py(session, code, timeout="600", check=True):
     return rc
 
 
+def download(session, remote, local):
+    """`colab download`. Returns None on success, "missing" or "directory" for
+    those two remote conditions, and dies on anything else."""
+    r = colab("download", "-s", session, remote, str(local), capture=True, check=False)
+    if r.returncode == 0:
+        return None
+    out = r.stdout + r.stderr
+    # colab-cli 0.7.4 wording: "Download failed: File or directory not found:
+    # PATH", "Download failed: Cannot download a directory: PATH", and for a
+    # missing session "Session 'S' not found."
+    if "File or directory not found" in out:
+        return "missing"
+    if "Cannot download a directory" in out:
+        return "directory"
+    sys.stderr.write(out)
+    if f"Session '{session}' not found" in out:
+        die(f"session '{session}' is gone (VM stopped or reclaimed); see `cgpu ls`", 3)
+    die("download failed (session gone? try `cgpu ls`)", 3)
+
+
 def download_text(session, remote):
     """Return the remote file's text, or None if it does not exist."""
     with tempfile.TemporaryDirectory() as d:
         local = os.path.join(d, "f")
-        r = colab("download", "-s", session, remote, local, capture=True, check=False)
-        if r.returncode != 0:
-            out = r.stdout + r.stderr
-            # colab-cli 0.7.4 wording: a missing file is "Download failed: File
-            # or directory not found: PATH"; a missing session is "Session 'S'
-            # not found." Only the former means "not written yet".
-            if "File or directory not found" in out:
-                return None
-            sys.stderr.write(out)
-            if f"Session '{session}' not found" in out:
-                die(f"session '{session}' is gone (VM stopped or reclaimed); "
-                    "see `cgpu ls`", 3)
-            die("download failed (session gone? try `cgpu ls`)", 3)
+        if download(session, remote, local) == "missing":
+            return None
         return Path(local).read_text(errors="replace")
+
+
+def upload_text(session, text, remote):
+    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        f.write(text)
+    try:
+        colab("upload", "-s", session, f.name, remote, capture=True)
+    finally:
+        os.unlink(f.name)
 
 
 def job_file(session):
     return STATE_DIR / f"{session}.json"
 
 
-def current_job(session):
+def load_job(session):
     p = job_file(session)
-    if not p.exists():
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def save_job(session, job):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = job_file(session).with_suffix(".tmp")
+    tmp.write_text(json.dumps(job))
+    os.replace(tmp, job_file(session))
+
+
+def current_job(session):
+    job = load_job(session)
+    if job is None:
         die(f"no job recorded for session '{session}' (start one with `cgpu start`)")
-    return json.loads(p.read_text())
+    return job
+
+
+def session_lock(session):
+    """Hold for the rest of the process: up, start and down on one session
+    must not interleave (each reads or replaces the job record)."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE_DIR / f"{session}.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        die(f"another `cgpu up/start/down` on '{session}' is in progress")
+    return lock
 
 
 def job_status(session, job):
@@ -146,6 +196,66 @@ def job_status(session, job):
     while it has not finished."""
     text = download_text(session, job["dir"] + "/status.json")
     return json.loads(text) if text is not None else None
+
+
+def cancel_path(job):
+    # In /tmp because the job's own dir may not exist yet, and an upload into
+    # a missing directory is not something to rely on.
+    return f"/tmp/cgpu-cancel-{job['id']}"
+
+
+def job_state(session, job):
+    """(kind, status): kind is "finished" (status is the dict), "running",
+    "queued" (start never confirmed it left the kernel queue), "cancelled"
+    (it never will: it aborts on arrival) or "lost" (its cell stopped without
+    a status, e.g. a kernel restart; the process may still be running)."""
+    st = job_status(session, job)
+    if st is not None:
+        return "finished", st
+    if job.get("state") == "cancelled":
+        return "cancelled", None
+    beat = download_text(session, job["dir"] + "/beat")
+    if beat is None:  # also records from before heartbeats existed
+        return ("queued" if job.get("state") == "submitting" else "running"), None
+    if time.time() - float(beat) > BEAT_STALE:
+        return "lost", None
+    return "running", None
+
+
+def settle(session, job):
+    """Resolve a job whose start was never confirmed. The cell writes `claim`
+    and then checks for the cancel marker; here the marker is written and then
+    `claim` checked. Whatever the interleaving, either we see the claim (the
+    job ran or is running) or the cell sees the marker (it will never run the
+    command). Returns the job's new state, "started" or "cancelled"."""
+    upload_text(session, "cancelled by cgpu start\n", cancel_path(job))
+    if (download_text(session, job["dir"] + "/claim") is not None
+            or job_status(session, job) is not None):
+        job["state"] = "started"
+    else:
+        job["state"] = "cancelled"
+    save_job(session, job)
+    return job["state"]
+
+
+def lost_msg(session, job):
+    return (f"job {job['id']} lost its kernel cell without recording an exit "
+            "status (kernel restarted or crashed?). Its process group may still be "
+            f"running and writing the log (`cgpu logs {session} --full`); "
+            f"`cgpu kill {session}` stops it")
+
+
+def require_idle(session, what):
+    """Refuse kernel work while a job holds the kernel: `colab exec` would
+    queue behind it, and the queued cell still runs after its client gives up."""
+    job = load_job(session)
+    if job is None:
+        return
+    kind, _ = job_state(session, job)
+    if kind in ("running", "queued"):
+        die(f"{what} needs an idle kernel, but job {job['id']} is {kind} on "
+            f"'{session}'. Wait for it (`cgpu wait {session}`), use a second "
+            "session, or pull single files, which work mid-job")
 
 
 # ---------------------------------------------------------------- commands
@@ -160,6 +270,14 @@ def cmd_up(a):
         args += ["--gpu", gpu]
     if a.high_mem:
         args.append("--high-mem")
+    lock = session_lock(a.session)  # noqa: F841 (held until exit)
+    # `colab new` on a name in use allocates a second VM and repoints the name
+    # at it, orphaning the first (still billed). `colab sessions` drops local
+    # names whose VM is gone, so only a live one is listed.
+    listing = colab("sessions", capture=True).stdout
+    if any(line.startswith(f"[{a.session}] ") for line in listing.splitlines()):
+        die(f"session '{a.session}' already exists. Use it as is, pick another "
+            f"name, or replace it deliberately: `cgpu down {a.session}` first")
     r = colab(*args, capture=True, check=False)
     print(r.stdout, end="")
     if r.returncode != 0:
@@ -241,25 +359,27 @@ def cmd_secrets(a):
 def cmd_start(a):
     if not a.cmd:
         die("usage: cgpu start SESSION [--cwd DIR] -- CMD [ARGS...]")
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    # Serialize starts on this session so two can't both pass the check below.
-    lock = open(STATE_DIR / f"{a.session}.lock", "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        die(f"another `cgpu start` on '{a.session}' is in progress")
-    if job_file(a.session).exists():
-        prev = current_job(a.session)
-        if job_status(a.session, prev) is None:
-            die(f"job {prev['id']} is still running on '{a.session}' (one job per "
+    lock = session_lock(a.session)  # noqa: F841 (held until exit)
+    prev = load_job(a.session)
+    if prev:
+        if prev.get("state") == "submitting":  # an earlier start never finished
+            settle(a.session, prev)
+        kind, _ = job_state(a.session, prev)
+        if kind in ("running", "queued"):
+            die(f"job {prev['id']} is still {kind} on '{a.session}' (one job per "
                 f"session): `cgpu wait {a.session}` or `cgpu kill {a.session}` first")
+        if kind == "lost" and not prev.get("killed"):
+            die(lost_msg(a.session, prev) + "; then start again")
     command = shlex.join(a.cmd)
     jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     jdir = f"{REMOTE_ROOT}/{jid}"
+    job = {"id": jid, "dir": jdir, "cmd": command, "cwd": a.cwd,
+           "started": time.time(), "state": "submitting"}
+    cancel = cancel_path(job)
     # Every outcome ends in status.json, launch failures (bad --cwd, missing
-    # program) included, so `wait` always has something to find.
+    # program) and cancellation included, so `wait` always has something to find.
     cell = f"""
-import json, os, subprocess, threading
+import json, os, subprocess, threading, time
 
 def _put(name, text):
     tmp = os.path.join({jdir!r}, '.' + name)
@@ -272,21 +392,28 @@ def _tail(log_path):
         with open(log_path, 'rb') as f:
             f.seek(max(0, os.path.getsize(log_path) - {TAIL_BYTES}))
             _put('tail', f.read().decode(errors='replace'))
+        _put('beat', repr(time.time()))
     except OSError:
-        pass  # `logs` falls back to the full log
+        pass
 
 os.makedirs({jdir!r}, exist_ok=True)
+_put('claim', '')  # before the cancel check: see settle() in cgpu
+_put('beat', repr(time.time()))
 log_path = os.path.join({jdir!r}, 'log')
 status = {{'rc': None, 'error': None}}
 with open(log_path, 'wb') as log:
-    try:
+    if os.path.exists({cancel!r}):
+        status = {{'rc': 125, 'error': 'cancelled before it started: cgpu start gave up waiting'}}
+        log.write((status['error'] + '\\n').encode())
+    else:
+      try:
         p = subprocess.Popen({list(a.cmd)!r}, cwd={a.cwd!r}, stdout=log,
                              stderr=subprocess.STDOUT, start_new_session=True,
                              env={{**os.environ, 'PYTHONUNBUFFERED': '1'}})
-    except Exception as e:
+      except Exception as e:
         status = {{'rc': 127, 'error': f'could not launch: {{type(e).__name__}}: {{e}}'}}
         log.write((status['error'] + '\\n').encode())
-    else:
+      else:
         _put('pid', str(p.pid))
         done = threading.Event()
         def _tailer():
@@ -303,34 +430,40 @@ _put('status.json', json.dumps(status))
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(cell)
     client_log = STATE_DIR / f"{a.session}-{jid}.client.log"
+    # Recorded before dispatch: from here on the cell may run whatever happens
+    # to this process, and the next `start` settles a record left "submitting".
+    save_job(a.session, job)
     with open(client_log, "w") as out:
         client = subprocess.Popen(
             ["colab", f"--auth={AUTH}", "exec", "-s", a.session,
              "--timeout", LONG, "-f", f.name],
             stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
-    job = {"id": jid, "dir": jdir, "cmd": command, "cwd": a.cwd,
-           "started": time.time()}
+    failure = None
     try:
-        for _ in range(90):  # wait for pid/status: proves the job left the queue
+        deadline = time.time() + START_WAIT
+        while True:  # a claim or status proves the job left the kernel queue
             # Read the client's state before the VM's: a fast job may finish
             # (and its client exit 0) between two polls.
             exited = client.poll() is not None
-            if (download_text(a.session, jdir + "/pid") is not None
+            if (download_text(a.session, jdir + "/claim") is not None
                     or job_status(a.session, job) is not None):
+                job["state"] = "started"
+                save_job(a.session, job)
                 break
             if exited:
-                die(f"exec client exited before the job started (exit "
-                    f"{client.returncode}); see {client_log}")
+                failure = (f"exec client exited before the job started (exit "
+                           f"{client.returncode}); see {client_log}")
+                break
+            if time.time() >= deadline:
+                failure = (f"job did not start within {START_WAIT}s (kernel busy?); "
+                           f"see {client_log}")
+                break
             time.sleep(2)
-        else:
-            client.terminate()
-            die(f"job did not start within 3 min; see {client_log}. The kernel "
-                "may be busy, and the queued job can still run once it is idle")
+        client.terminate()  # the kernel cell keeps running without us
+        if failure and settle(a.session, job) == "cancelled":
+            die(failure + ". It was cancelled and will not run later")
     finally:
         os.unlink(f.name)
-    client.terminate()  # the kernel cell keeps running without us
-    # Recorded only now, so a failed start leaves the previous job's record.
-    job_file(a.session).write_text(json.dumps(job))
     st = job_status(a.session, job)
     if st and st["error"]:
         die(f"job {jid}: {st['error']}", st["rc"])
@@ -340,39 +473,48 @@ _put('status.json', json.dumps(status))
 
 def cmd_logs(a):
     job = current_job(a.session)
+    # The tail is missing only in a job's first ~2s, while the log is small.
     text = None if a.full else download_text(a.session, job["dir"] + "/tail")
     if text is not None:
         lines = text.replace("\r", "\n").splitlines()  # tqdm writes \r
         if len(text.encode()) >= TAIL_BYTES:
             lines = lines[1:]  # the tail starts mid-line
-        if len(lines) < a.n:
-            text = None  # more lines wanted than the tail holds
-    if text is None:
+            if len(lines) < a.n:
+                print(f"[cgpu] the log's last {TAIL_BYTES // 1024}KB hold only "
+                      f"{len(lines)} complete lines; `--full` downloads the whole "
+                      "log", file=sys.stderr)
+    else:
         text = download_text(a.session, job["dir"] + "/log")
-        if text is None:
-            die("no log yet")
-        lines = text.replace("\r", "\n").splitlines()
-    print("\n".join(lines[-a.n:]))
-    st = job_status(a.session, job)
+        lines = text.replace("\r", "\n").splitlines() if text is not None else []
+    if lines:
+        print("\n".join(lines[-a.n:]))
+    kind, st = job_state(a.session, job)
     mins = (time.time() - job["started"]) / 60
-    print(f"[cgpu] job {job['id']}: " + (
-        f"FINISHED exit={st['rc']}" + (f" ({st['error']})" if st["error"] else "")
-        if st else f"running ({mins:.0f} min)"), file=sys.stderr)
-    return st
+    print(f"[cgpu] job {job['id']}: " + {
+        "finished": lambda: f"FINISHED exit={st['rc']}"
+                            + (f" ({st['error']})" if st["error"] else ""),
+        "running": lambda: f"running ({mins:.0f} min)",
+        "queued": lambda: "start not confirmed (queued behind other kernel work?)",
+        "cancelled": lambda: "cancelled before it started",
+        "lost": lambda: "LOST: " + lost_msg(a.session, job),
+    }[kind](), file=sys.stderr)
+    return kind, st
 
 
 def cmd_wait(a):
     job = current_job(a.session)
     deadline = a.timeout and time.time() + a.timeout
-    while (st := job_status(a.session, job)) is None:
+    while (kind := job_state(a.session, job)[0]) in ("running", "queued"):
         if deadline and time.time() >= deadline:
             a.n, a.full = 20, False
             cmd_logs(a)
-            die(f"job {job['id']} still running after {a.timeout}s", 124)
+            die(f"job {job['id']} still {kind} after {a.timeout}s", 124)
         time.sleep(a.poll if not deadline else
                    max(0, min(a.poll, deadline - time.time())))
     a.n, a.full = 40, False
-    cmd_logs(a)
+    kind, st = cmd_logs(a)
+    if kind != "finished":
+        die(f"job {job['id']} has no exit status ({kind})", 3)
     rc = st["rc"]
     sys.exit(128 - rc if rc < 0 else rc)  # killed by signal N -> 128+N
 
@@ -385,19 +527,34 @@ def cmd_kill(a):
     # The kernel is busy running the job cell, so go through the terminal.
     colab("console", "-s", a.session, stdin=f"kill -TERM -{pid.strip()}\n",
           capture=True, timeout=60)
+    job["killed"] = True  # lets `start` proceed past a lost job
+    save_job(a.session, job)
     print(f"[cgpu] sent SIGTERM to process group {pid.strip()}")
 
 
 def cmd_pull(a):
     local = Path(a.local).expanduser()
+    # A file goes into LOCAL when LOCAL is a directory or is spelled like one.
+    into = local.is_dir() or a.local.endswith(("/", os.sep))
+    dest = local / PurePosixPath(a.remote).name if into else local
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # Download beside the destination and rename, so an interrupted pull never
+    # leaves (or overwrites a good copy with) half a checkpoint.
+    part = dest.parent / f".{dest.name}.cgpu-{uuid.uuid4().hex[:8]}.part"
+    try:
+        err = download(a.session, a.remote, part)
+        if err is None:
+            os.replace(part, dest)
+            print(f"[cgpu] {a.remote} -> {dest}")
+            return
+    finally:
+        part.unlink(missing_ok=True)
+    if err == "missing":
+        die(f"{a.remote} does not exist on '{a.session}'")
+    # A directory: tar it on the VM, which needs an idle kernel.
+    require_idle(a.session, f"pulling directory {a.remote}")
     tgz = f"/tmp/cgpu-pull-{uuid.uuid4().hex[:8]}.tgz"
-    r = colab("download", "-s", a.session, a.remote, str(local), capture=True, check=False)
-    if r.returncode == 0:
-        print(r.stdout.strip())
-        return
-    # Probably a directory: tar it on the VM (needs an idle kernel).
-    exec_py(a.session, f"import os,tarfile\nassert os.path.isdir({a.remote!r}), "
-            f"'no such file or dir: ' + {a.remote!r}\n"
+    exec_py(a.session, f"import os,tarfile\n"
             f"with tarfile.open({tgz!r},'w:gz') as t: t.add({a.remote!r},arcname='.')\n"
             f"print('packed', os.path.getsize({tgz!r})//10**6, 'MB')")
     with tempfile.TemporaryDirectory() as d:
@@ -422,6 +579,7 @@ def cmd_sh(a):
 
 
 def cmd_down(a):
+    lock = session_lock(a.session)  # noqa: F841 (held until exit)
     colab("stop", "-s", a.session)
     job_file(a.session).unlink(missing_ok=True)
     colab("usage")
