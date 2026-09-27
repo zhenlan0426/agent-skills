@@ -37,7 +37,7 @@ or newer features. These workarounds are version-specific, not platform promises
 Run the offline helper tests with:
 
 ```bash
-python3 scripts/test_kgpu.py
+python3 tests/test_kgpu.py
 ```
 
 They exercise packaging and actual generated-runner execution in temporary

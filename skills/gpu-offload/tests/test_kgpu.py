@@ -29,7 +29,7 @@ class HelperTests(unittest.TestCase):
         self.args = SimpleNamespace(project=str(self.project), job=str(self.job),
                                     owner='testuser', accelerator='cpu', run_timeout=300,
                                     internet=False, dataset=[], competition=[],
-                                    kernel_source=[], exclude=[])
+                                    kernel_source=[], exclude=[], setup=None)
 
     def prepare(self, command=None):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -61,12 +61,14 @@ class HelperTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 kg.bundle(self.project, [])
 
-    def run_generated(self, command, gpu=False):
+    def run_generated(self, command, gpu=False, setup=None):
         payload, _ = kg.bundle(self.project, [])
         working = self.root / 'remote'
-        script = kg.runner(payload, command, 'test-run', gpu)
-        # The only runtime substitution isolates Kaggle's absolute output root.
+        script = kg.runner(payload, command, 'test-run', gpu, setup)
+        # Runtime substitutions isolate Kaggle's absolute output root and /tmp.
         script = script.replace("pathlib.Path('/kaggle/working')", f'pathlib.Path({str(working)!r})')
+        script = script.replace("pathlib.Path('/tmp/kgpu-envsetup')",
+                                f'pathlib.Path({str(self.root / "envsetup")!r})')
         script_path = self.root / 'kernel.py'
         script_path.write_text(script)
         run = subprocess.run([sys.executable, str(script_path)], capture_output=True, text=True)
@@ -156,6 +158,32 @@ class HelperTests(unittest.TestCase):
         run, working = self.run_generated([sys.executable, 'train.py'])
         self.assertNotEqual(run.returncode, 0)
         self.assertEqual(json.loads((working / 'kgpu-result.json').read_text())['exit_code'], 7)
+
+    def test_setup_runs_before_command_and_failure_skips_it(self):
+        (self.project / 'train.py').write_text(
+            'import os, pathlib\n'
+            'pathlib.Path(os.environ["KGPU_OUTPUT_DIR"], "ran").write_text("yes")\n')
+        fake = ('import pathlib, sys\n'
+                'if sys.argv[1] == "install":\n'
+                '    pathlib.Path(sys.argv[sys.argv.index("--report") + 1]).write_text(" ".join(sys.argv[2:]))\n'
+                '    sys.exit(int(sys.argv[2]))\n')
+        for code in (0, 3):
+            run, working = self.run_generated([sys.executable, 'train.py'],
+                                              setup=(fake, [str(code), '-r', 'req.txt']))
+            result = json.loads((working / 'kgpu-result.json').read_text())
+            self.assertEqual(result['setup_exit_code'], code)
+            self.assertEqual(result['exit_code'], code)
+            self.assertEqual((working / 'out/ran').exists(), code == 0, run.stdout)
+            self.assertTrue((working / 'out/envsetup.json').read_text().startswith(f'{code} -r req.txt'))
+            subprocess.run(['rm', '-rf', str(working)])
+
+    def test_setup_needs_internet_or_wheels(self):
+        self.args.setup = '-r requirements.txt'
+        with self.assertRaises(ValueError):
+            self.prepare()
+        self.args.setup = '-r requirements.txt --wheels /kaggle/input/wheels'
+        self.assertEqual(self.prepare()['setup'], ['-r', 'requirements.txt', '--wheels', '/kaggle/input/wheels'])
+        self.assertIn('def cmd_install', (self.job / 'kernel.py').read_text())
 
     def test_executable_permission_preserved(self):
         executable = self.project / 'run.sh'

@@ -17,6 +17,8 @@ Usage:
   cgpu up SESSION GPU [--high-mem]        GPU: T4 L4 G4 A100 H100 cpu
   cgpu push SESSION LOCAL [REMOTE]        file or dir (dirs are tarred); default /content/<basename>
   cgpu secrets SESSION [kaggle] [hf]      copy ~/.kaggle/kaggle.json / HF token onto the VM
+  cgpu setup SESSION [-- ARGS]            fingerprint the VM, then `envsetup install ARGS`
+                                          (paths are VM paths, e.g. -r /content/p/requirements.txt)
   cgpu start SESSION [--cwd DIR] -- CMD   start CMD as a background job (one per session)
   cgpu logs SESSION [-n N] [--full]       tail the current job's log
   cgpu wait SESSION [--poll S] [--timeout S]  block until the job ends; exits with
@@ -52,6 +54,7 @@ AUTH = os.environ.get("CGPU_AUTH", "oauth2")
 GPUS = {"T4", "L4", "G4", "A100", "H100"}
 STATE_DIR = Path.home() / ".cache" / "cgpu"
 REMOTE_ROOT = "/content/.cgpu"
+ENVSETUP = Path(__file__).resolve().parent / "envsetup"
 TAR_EXCLUDES = {".git", "__pycache__", ".venv", "venv", "node_modules", "wandb",
                 ".ipynb_checkpoints", ".mypy_cache", ".pytest_cache"}
 # `colab exec --timeout` is a wall-clock budget; anything short kills the
@@ -356,6 +359,25 @@ def cmd_secrets(a):
         for t, r in moves), timeout="120")
 
 
+def cmd_setup(a):
+    remote = "/tmp/cgpu-envsetup"  # uploads into a missing directory fail
+    require_idle(a.session, "setup")
+    colab("upload", "-s", a.session, str(ENVSETUP), remote, capture=True)
+    steps = [["probe", "--json", f"{REMOTE_ROOT}/env.json"]]
+    if a.cmd:
+        steps.append(["install", *a.cmd, "--report", f"{REMOTE_ROOT}/envsetup.json"])
+    # Stream line by line: a child's raw stdout bypasses the kernel's iopub
+    # stream, and an install can run for minutes.
+    code = "import subprocess, sys\n" + "".join(
+        f"p = subprocess.Popen([sys.executable, {remote!r}, *{step!r}], "
+        "stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\n"
+        "for line in p.stdout:\n    print(line, end='')\n"
+        "_cgpu_rc = _cgpu_rc or p.wait()\n" for step in steps)
+    rc = exec_py(a.session, code, timeout=str(a.timeout), check=False)
+    if rc:
+        die(f"setup failed (exit {rc}); report at {REMOTE_ROOT}/envsetup.json", rc)
+
+
 def cmd_start(a):
     if not a.cmd:
         die("usage: cgpu start SESSION [--cwd DIR] -- CMD [ARGS...]")
@@ -600,6 +622,8 @@ def main():
     s.add_argument("remote", nargs="?"); s.set_defaults(f=cmd_push)
     s = sub.add_parser("secrets"); s.add_argument("session")
     s.add_argument("which", nargs="*"); s.set_defaults(f=cmd_secrets)
+    s = sub.add_parser("setup"); s.add_argument("session")
+    s.add_argument("--timeout", type=int, default=3600); s.set_defaults(f=cmd_setup)
     s = sub.add_parser("start"); s.add_argument("session")
     s.add_argument("--cwd", default="/content"); s.set_defaults(f=cmd_start)
     s = sub.add_parser("logs"); s.add_argument("session")

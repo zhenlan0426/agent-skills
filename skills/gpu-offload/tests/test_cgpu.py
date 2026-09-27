@@ -81,6 +81,25 @@ class CgpuTest(unittest.TestCase):
             time.sleep(0.2)
         self.fail("condition not met")
 
+    # ------------------------------------------------------------- setup
+
+    def test_setup_probes_then_installs_and_propagates_refusal(self):
+        self.cgpu("up", "s", "T4")
+        r = self.cgpu("setup", "s")
+        self.assertIn("installer: pip", r.stdout)
+        self.assertTrue((self.vm() / "content/.cgpu/env.json").exists())
+        # The fake runs cells on this machine, where envsetup refuses to
+        # touch the base interpreter: the exit code must survive the trip.
+        r = self.cgpu("setup", "s", "--", "requests", ok=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("refusing to install into the base interpreter", r.stdout)
+
+    def test_setup_refused_mid_job(self):
+        self.cgpu("up", "s", "T4")
+        self.cgpu("start", "s", "--", "sleep", "5")
+        r = self.cgpu("setup", "s", ok=False)
+        self.assertIn("needs an idle kernel", r.stderr)
+
     # ------------------------------------------------------------- start
 
     def test_start_timeout_cancels_queued_job_and_allows_retry(self):

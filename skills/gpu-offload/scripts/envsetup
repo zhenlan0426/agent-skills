@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""envsetup: fingerprint a GPU machine and install a project's dependencies
+without replacing the CUDA stack it came with.
+
+Runs on the target itself (local 4090, a Kaggle kernel, a Colab VM), with the
+standard library only. `kgpu prepare --setup` and `cgpu setup` ship it there.
+
+  envsetup probe [--json FILE]
+      Platform, Python, installer, GPU, torch/CUDA, internet, key packages.
+  envsetup wheels --env ENV.json -o DIR [-r REQ ...] [PKG ...] [--skip NAME]
+      On an online machine: download the wheels a target (described by its
+      `probe --json`) is missing for these requirements, resolved against what
+      it already has. For Kaggle kernels without internet: upload DIR as a
+      private dataset, then install there with --wheels /kaggle/input/...
+  envsetup install [-r REQ ...] [PKG ...] [--allow NAME] [--skip NAME]
+                   [--wheels DIR] [--venv DIR] [--installer auto|uv|pip]
+                   [--report FILE] [--dry-run]
+      Installs with every preinstalled CUDA-bound package (torch, torchvision,
+      torchaudio, triton, xformers, jax/jaxlib, tensorflow, nvidia-*) pinned to
+      the version already there. A requirement that needs a different one fails
+      resolution instead of silently pulling a multi-GB wheel built for another
+      CUDA. --allow NAME lifts one pin, deliberately.
+
+Exit codes: 0 ok, 1 install/verification failed, 2 usage or refused.
+"""
+import argparse
+import json
+import os
+import platform as pyplatform
+import re
+import shutil
+import subprocess
+import sys
+import sysconfig
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+PROTECTED = re.compile(r'^(torch|torchvision|torchaudio|triton|pytorch-triton|xformers|'
+                       r'jax|jaxlib|jax-cuda\d+-(plugin|pjrt)|tensorflow|nvidia-.+)$')
+KEY_PACKAGES = ['torch', 'torchvision', 'torchaudio', 'triton', 'xformers', 'flash-attn',
+                'numpy', 'transformers', 'accelerate', 'peft', 'trl', 'datasets',
+                'bitsandbytes', 'deepspeed', 'vllm', 'jax', 'jaxlib', 'tensorflow',
+                'scikit-learn', 'pandas', 'huggingface-hub', 'safetensors', 'tokenizers']
+# Packages whose wheels need a newer GPU than some targets have. Checked before
+# installing so a T4 fails in seconds instead of after a 20-minute source build.
+MIN_CAPABILITY = {'flash-attn': (8, 0)}
+# One site outside PyPI so a PyPI-only allowlist (competition kernels) still
+# shows as "online" if it lets PyPI through.
+PROBE_URLS = ['https://pypi.org/simple/pip/', 'https://huggingface.co']
+
+
+def norm(name):
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+def say(*parts):
+    print('[envsetup]', *parts, flush=True)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, text=True, capture_output=True, **kw)
+
+
+# ------------------------------------------------------------------ probing
+
+def platform_name():
+    if os.environ.get('KAGGLE_KERNEL_RUN_TYPE') or Path('/kaggle/working').is_dir():
+        return 'kaggle'
+    if os.environ.get('COLAB_RELEASE_TAG') or os.environ.get('COLAB_GPU') is not None:
+        return 'colab'
+    return 'local'
+
+
+def installed(python):
+    """{normalized name: version} for the environment `python` runs in."""
+    # distributions() follows sys.path order: the first copy of a name is the
+    # one that imports, so a venv's copy wins over an inherited one.
+    code = ('import json, importlib.metadata as m\n'
+            'print(json.dumps([[d.metadata["Name"], d.version] for d in m.distributions()'
+            ' if d.metadata["Name"]]))')
+    found = {}
+    for name, version in json.loads(run([python, '-c', code], check=True).stdout):
+        found.setdefault(norm(name), version)
+    return found
+
+
+def layered(python):
+    """Whether some packages come from a layer below the install target: a
+    venv made with --system-site-packages, or a populated user site. uv only
+    sees the target layer, so there it re-downloads torch and friends into it
+    (measured: a system-site venv over torch 2.11 resolved torch 2.14)."""
+    code = ('import site, sys, pathlib\n'
+            'cfg = pathlib.Path(sys.prefix, "pyvenv.cfg")\n'
+            'inherit = cfg.exists() and "include-system-site-packages = true" in cfg.read_text()\n'
+            'user = site.ENABLE_USER_SITE and any(pathlib.Path(site.getusersitepackages()).glob("*.dist-info"))\n'
+            'print(bool(inherit or user))')
+    return run([python, '-c', code]).stdout.strip() == 'True'
+
+
+def gpus():
+    if not shutil.which('nvidia-smi'):
+        return []
+    r = run(['nvidia-smi', '--query-gpu=name,memory.total,driver_version,compute_cap',
+             '--format=csv,noheader,nounits'])
+    if r.returncode:
+        return []
+    cards = []
+    for line in r.stdout.strip().splitlines():
+        name, mem, driver, cap = [x.strip() for x in line.split(',')]
+        cards.append({'name': name, 'memory_mib': int(float(mem)), 'driver': driver,
+                      'compute_cap': cap})
+    return cards
+
+
+def driver_cuda():
+    """Highest CUDA the driver supports, from the nvidia-smi banner."""
+    if not shutil.which('nvidia-smi'):
+        return None
+    m = re.search(r'CUDA Version:\s*([\d.]+)', run(['nvidia-smi']).stdout)
+    return m and m[1]
+
+
+def torch_info(python):
+    code = ('import json, torch\n'
+            'c = torch.cuda.is_available()\n'
+            'print(json.dumps({"version": torch.__version__, "cuda": torch.version.cuda,'
+            ' "cudnn": torch.backends.cudnn.version(), "cuda_available": c,'
+            ' "devices": torch.cuda.device_count() if c else 0,'
+            ' "bf16": bool(c and torch.cuda.is_bf16_supported()),'
+            ' "arch_list": torch.cuda.get_arch_list() if c else []}))')
+    r = run([python, '-c', code], timeout=300)
+    if r.returncode:
+        return {'error': (r.stderr.strip().splitlines() or ['import failed'])[-1]}
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def online():
+    for url in PROBE_URLS:
+        try:
+            urllib.request.urlopen(url, timeout=6).close()
+            return True
+        except Exception:  # offline, DNS blocked, proxy refusal: all the same here
+            continue
+    return False
+
+
+def uv_path():
+    path = shutil.which('uv')
+    if path:
+        return path
+    try:  # `pip install uv` on a PATH-less layout
+        import uv  # type: ignore
+        return uv.find_uv_bin()
+    except Exception:
+        return None
+
+
+def externally_managed(python):
+    code = ('import sysconfig, pathlib; '
+            'print(pathlib.Path(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED").exists())')
+    return run([python, '-c', code]).stdout.strip() == 'True'
+
+
+def in_venv(python):
+    return run([python, '-c', 'import sys; print(sys.prefix != sys.base_prefix)']).stdout.strip() == 'True'
+
+
+def probe(python=sys.executable):
+    pkgs = installed(python)
+    pyver = run([python, '-c', 'import sys; print("%d.%d.%d" % sys.version_info[:3])']).stdout.strip()
+    purelib = run([python, '-c', 'import sysconfig; print(sysconfig.get_path("purelib"))']).stdout.strip()
+    usersite = run([python, '-c', 'import site; print(site.ENABLE_USER_SITE and site.getusersitepackages() or "")']).stdout.strip()
+    pip = run([python, '-m', 'pip', '--version'])
+    uv = uv_path()
+    info = {
+        'platform': platform_name(),
+        'python': pyver,
+        'executable': python,
+        'venv': in_venv(python),
+        'externally_managed': externally_managed(python),
+        'site_packages': purelib,
+        'site_writable': os.access(purelib, os.W_OK),
+        'user_site': usersite if usersite and Path(usersite).is_dir() else None,
+        'pip': pip.stdout.split()[1] if pip.returncode == 0 else None,
+        'uv': run([uv, '--version']).stdout.strip() if uv else None,
+        'pip_index': {k: v for k, v in os.environ.items()
+                      if k.startswith(('PIP_', 'UV_')) and 'TOKEN' not in k and 'PASSWORD' not in k},
+        'gpus': gpus(),
+        'driver_cuda': driver_cuda(),
+        'nvcc': bool(shutil.which('nvcc')),
+        'online': online(),
+        'packages_total': len(pkgs),
+        'packages': {k: pkgs[k] for k in KEY_PACKAGES if k in pkgs},
+        'all_packages': pkgs,
+        'protected': {k: v for k, v in sorted(pkgs.items()) if PROTECTED.match(k)},
+        'disk_free_gb': round(shutil.disk_usage(os.getcwd()).free / 1e9, 1),
+        'glibc': run([python, '-c', 'import platform; print(platform.libc_ver()[1])']).stdout.strip(),
+        'machine': pyplatform.machine(),
+    }
+    info['torch'] = torch_info(python) if 'torch' in pkgs else None
+    return info
+
+
+def summary(p):
+    t = p['torch'] or {}
+    gpu = ', '.join(f"{g['name']} {g['memory_mib'] // 1024}GB sm{g['compute_cap']}" for g in p['gpus']) or 'none'
+    lines = [
+        f"platform {p['platform']}; python {p['python']} ({p['executable']}"
+        + (', venv' if p['venv'] else '') + (', externally-managed' if p['externally_managed'] else '')
+        + (', site read-only' if not p['site_writable'] else '')
+        + (f", user site {p['user_site']}" if p['user_site'] else '') + ')',
+        f"installer: pip {p['pip']}; uv {p['uv'] or 'absent'}; internet {'yes' if p['online'] else 'NO'}",
+        f"gpu: {gpu}; driver CUDA {p['driver_cuda']}",
+        (f"torch {t.get('version')} (CUDA {t.get('cuda')}), cuda_available={t.get('cuda_available')}, "
+         f"bf16={t.get('bf16')}" if 'version' in t else f"torch: {t.get('error', 'not installed')}"),
+        'key: ' + ', '.join(f'{k} {v}' for k, v in p['packages'].items()),
+        f"{p['packages_total']} distributions; {len(p['protected'])} pinned by install; "
+        f"{p['disk_free_gb']} GB free here",
+    ]
+    return '\n'.join(lines)
+
+
+def cmd_probe(a):
+    p = probe()
+    print(summary(p))
+    if a.json:
+        Path(a.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.json).write_text(json.dumps(p, indent=2) + '\n')
+        say('wrote', a.json)
+    return 0
+
+
+# --------------------------------------------------------------- installing
+
+def read_requirements(path, seen=None):
+    """Requirement lines from a file, following -r/-c includes relative to it.
+    Returns (name, line) pairs; options (-e, --index-url, ...) keep name None."""
+    seen = seen or set()
+    path = Path(path).resolve()
+    if path in seen:
+        return []
+    seen.add(path)
+    out = []
+    for raw in path.read_text().splitlines():
+        line = raw.split(' #')[0].strip()
+        if not line or line.startswith('#'):
+            continue
+        m = re.match(r'^(-r|--requirement)\s*=?\s*(\S+)$', line)
+        if m:
+            out += read_requirements(path.parent / m[2], seen)
+            continue
+        m = re.match(r'^(-c|--constraint)\s*=?\s*(\S+)$', line)
+        if m:  # the lines are rewritten to a temp file: anchor the path here
+            line = f'-c {(path.parent / m[2]).resolve()}'
+        out.append((requirement_name(line), line))
+    return out
+
+
+def requirement_name(line):
+    if line.startswith('-'):
+        return None
+    m = re.match(r'^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*(@|[<>=!~;]|$)', line)
+    if m:
+        return norm(m[1])
+    m = re.search(r'#egg=([A-Za-z0-9._-]+)', line)  # git+https://...#egg=name
+    return norm(m[1]) if m else None
+
+
+def gpu_capability():
+    caps = [tuple(int(x) for x in g['compute_cap'].split('.')) for g in gpus() if g['compute_cap']]
+    return min(caps) if caps else None
+
+
+def pip_check(python):
+    r = run([python, '-m', 'pip', 'check'])
+    return set(l for l in (r.stdout + r.stderr).splitlines() if l.strip() and 'No broken' not in l)
+
+
+def installer_cmd(a, python, target_managed):
+    uv = uv_path() if a.installer in ('auto', 'uv') else None
+    if a.installer == 'uv' and not uv:
+        raise SystemExit('envsetup: --installer uv but uv was not found')
+    if a.installer == 'auto' and uv and layered(python):
+        say('layered environment (inherited site-packages): using pip, which '
+            'counts inherited packages as installed; uv would duplicate them')
+        uv = None
+    if uv:
+        cmd = [uv, 'pip', 'install', '--python', python]
+        if target_managed:
+            cmd.append('--break-system-packages')
+        return cmd, 'uv'
+    cmd = [python, '-m', 'pip', 'install', '--disable-pip-version-check']
+    if target_managed:
+        cmd.append('--break-system-packages')
+    return cmd, 'pip'
+
+
+def ensure_venv(path):
+    """A venv that sees the base interpreter's packages (the preinstalled
+    torch stack), so only the project's extras land inside it."""
+    path = Path(path).resolve()
+    python = path / 'bin' / 'python'
+    if python.exists():
+        return str(python)
+    say(f'creating {path} (inherits system site-packages)')
+    uv = uv_path()
+    if uv:
+        subprocess.run([uv, 'venv', '--system-site-packages', '--python', sys.executable,
+                        str(path)], check=True)
+    else:
+        subprocess.run([sys.executable, '-m', 'venv', '--system-site-packages', str(path)], check=True)
+    return str(python)
+
+
+def cmd_install(a):
+    python = ensure_venv(a.venv) if a.venv else sys.executable
+    reqs = []
+    for f in a.requirement:
+        reqs += read_requirements(f)
+    reqs += [(requirement_name(p), p) for p in a.packages]
+    if not reqs:
+        say('nothing to install')
+        return 0
+    skip = {norm(s) for s in a.skip}
+    allow = {norm(s) for s in a.allow}
+    kept = [(n, l) for n, l in reqs if n not in skip]
+    for n, l in reqs:
+        if n in skip:
+            say(f'skipping {l!r} (--skip)')
+
+    platform = platform_name()
+    managed = externally_managed(python) and not in_venv(python)
+    if platform == 'local' and not in_venv(python) and not a.system:
+        say(f'refusing to install into the base interpreter {python} on this machine: it '
+            'holds the shared torch stack. Use --venv .venv (inherits it, keeps the '
+            'extras per project) or --system if you really mean it.')
+        return 2
+
+    cap = gpu_capability()
+    blocked = [(n, l) for n, l in kept if n in MIN_CAPABILITY and cap and cap < MIN_CAPABILITY[n]]
+    if blocked:
+        for n, l in blocked:
+            need = '.'.join(map(str, MIN_CAPABILITY[n]))
+            say(f'{l!r} needs compute capability >= {need}; this GPU is sm{cap[0]}{cap[1]}. '
+                f'Pass --skip {n} and fall back in code (for flash-attn: '
+                'attn_implementation="sdpa").')
+        return 2
+
+    before = installed(python)
+    pins = {k: v for k, v in before.items() if PROTECTED.match(k) and k not in allow}
+    conflicts = [(n, l) for n, l in kept if n in pins and not satisfied_by(l, pins[n])]
+    for n, l in conflicts:
+        say(f'{l!r} conflicts with preinstalled {n}=={pins[n]}. Loosen the requirement, '
+            f'or --allow {n} to replace it (a multi-GB download that must match driver '
+            f'CUDA {driver_cuda()}).')
+    if conflicts:
+        return 2
+    say(f'pinning {len(pins)} preinstalled packages: '
+        + ', '.join(f'{k}=={v}' for k, v in pins.items() if not k.startswith('nvidia-'))
+        + (f' + {sum(k.startswith("nvidia-") for k in pins)} nvidia-*' if pins else ''))
+    check_before = pip_check(python)
+
+    with tempfile.TemporaryDirectory() as d:
+        cons = Path(d) / 'constraints.txt'
+        cons.write_text(''.join(f'{k}=={v}\n' for k, v in pins.items()))
+        reqfile = Path(d) / 'requirements.txt'
+        reqfile.write_text(''.join(l + '\n' for _, l in kept))
+        cmd, tool = installer_cmd(a, python, managed or (a.system and externally_managed(python)))
+        cmd += ['-r', str(reqfile), '-c', str(cons)]
+        if a.wheels:
+            cmd += ['--no-index']
+            for w in find_wheel_dirs(a.wheels):
+                cmd += ['--find-links', w]
+        if a.dry_run:
+            cmd.append('--dry-run')
+        say('running:', ' '.join(cmd[:3]), '... (' + tool + ')')
+        t0 = time.time()
+        r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        noise = ('Requirement already satisfied', '[notice]')
+        lines = r.stdout.splitlines()
+        print('\n'.join(l for l in lines if not l.startswith(noise)), flush=True)
+        quiet = sum(l.startswith(noise[0]) for l in lines)
+        if quiet:
+            say(f'({quiet} "Requirement already satisfied" lines hidden)')
+        elapsed = time.time() - t0
+    if r.returncode:
+        hint = ''
+        if not a.wheels and not online():
+            hint = (' No internet here: on Kaggle, prepare with --internet, or pass '
+                    '--wheels DIR pointing at wheels attached as a dataset.')
+        say(f'{tool} failed (exit {r.returncode}) after {elapsed:.0f}s.' + hint)
+        write_report(a, dict(ok=False, tool=tool, elapsed=elapsed, platform=platform))
+        return 1
+    if a.dry_run:
+        return 0
+
+    after = installed(python)
+    changed = {k: [before.get(k), v] for k, v in after.items() if before.get(k) != v}
+    removed = sorted(set(before) - set(after))
+    moved = {k: changed[k] for k in changed if k in pins}
+    new_breaks = sorted(pip_check(python) - check_before)
+    say(f'{tool} finished in {elapsed:.0f}s: {len(changed)} added/changed, {len(removed)} removed')
+    for k, (old, new) in sorted(changed.items()):
+        print(f'  {k}: {old or "-"} -> {new}')
+    # The pins can make the resolver settle for an older release (measured on
+    # Colab: vllm 0.26 against the image's torch, where unpinned pip took 0.30
+    # plus torch 2.13). Show what each request became so that is visible.
+    say('requested -> importable: ' + ', '.join(
+        f'{n} {after.get(n, "MISSING")}' for n, _ in kept if n))
+    ok = not moved
+    if moved:
+        say('ERROR: pinned packages changed anyway:', moved)
+    if new_breaks:
+        say('new `pip check` complaints (were not there before):')
+        for line in new_breaks:
+            print('  ' + line)
+    verdict = verify_torch(python) if 'torch' in after else None
+    if verdict and not verdict['ok']:
+        ok = False
+        say('ERROR: torch no longer sees the GPU after install:', verdict['detail'])
+    write_report(a, dict(ok=ok, tool=tool, elapsed=elapsed, platform=platform, python=python,
+                         changed=changed, removed=removed, new_pip_check=new_breaks,
+                         torch=verdict))
+    if a.venv:
+        say(f'use {python} (or `source {Path(python).parent}/activate`) to run the project')
+    return 0 if ok else 1
+
+
+def satisfied_by(line, version):
+    """Whether a simple requirement line accepts `version`. Anything this
+    can't evaluate (URLs, markers, odd specifiers) is left to the resolver."""
+    spec = re.sub(r'^[A-Za-z0-9._-]+\s*(\[[^\]]*\])?', '', line).split(';')[0].strip()
+    if not spec or spec.startswith('@'):
+        return True
+    base = version.split('+')[0]
+    for part in spec.split(','):
+        m = re.match(r'^\s*(==|>=|<=|!=|~=|>|<)\s*([\w.*+]+)\s*$', part)
+        if not m:
+            return True
+        op, want = m[1], m[2]
+        if op == '==' and want.endswith('.*'):
+            if not (base + '.').startswith(want[:-1]):
+                return False
+            continue
+        if op == '==':
+            if want != version and want != base:
+                return False
+            continue
+        a, b = vkey(base), vkey(want.split('+')[0])
+        if a is None or b is None:
+            return True
+        if op == '~=':
+            prefix = vkey('.'.join(want.split('.')[:-1]))
+            if a < b or a[:len(prefix)] != prefix:
+                return False
+            continue
+        if not {'>=': a >= b, '<=': a <= b, '!=': a != b, '>': a > b, '<': a < b}[op]:
+            return False
+    return True
+
+
+def vkey(v):
+    parts = re.match(r'^(\d+(?:\.\d+)*)', v)
+    if not parts:
+        return None
+    nums = [int(x) for x in parts[1].split('.')]
+    while nums and nums[-1] == 0:
+        nums.pop()
+    return tuple(nums)
+
+
+def verify_torch(python):
+    if not gpus():
+        return None
+    t = torch_info(python)
+    ok = bool(t.get('cuda_available'))
+    return {'ok': ok, 'detail': t}
+
+
+def cmd_wheels(a):
+    """Resolve REQ for the target described by --env, preferring the versions
+    it already has, then download only what it lacks as wheels."""
+    env = json.loads(Path(a.env).read_text())
+    have = env['all_packages']
+    uv = uv_path()
+    if not uv:
+        say('wheels needs uv (pip cannot resolve for another interpreter): '
+            'https://docs.astral.sh/uv/')
+        return 2
+    skip = {norm(x) for x in a.skip}
+    reqs = []
+    for f in a.requirement:
+        reqs += read_requirements(f)
+    reqs += [(requirement_name(p), p) for p in a.packages]
+    reqs = [(n, l) for n, l in reqs if n not in skip]
+    pins = {k: v for k, v in have.items() if PROTECTED.match(k)}
+    conflicts = [l for n, l in reqs if n in pins and not satisfied_by(l, pins[n])]
+    if conflicts:
+        say('conflict with the target\'s preinstalled CUDA stack:', ', '.join(conflicts))
+        return 2
+    glibc = env.get('glibc') or '2.28'
+    target = f"{env.get('machine') or 'x86_64'}-manylinux_{glibc.replace('.', '_')}"
+    pyver = '.'.join(env['python'].split('.')[:2])
+    out = Path(a.output).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as d:
+        req_in = Path(d) / 'requirements.in'
+        req_in.write_text(''.join(l + '\n' for _, l in reqs))
+        cons = Path(d) / 'constraints.txt'
+        cons.write_text(''.join(f'{k}=={v}\n' for k, v in pins.items()))
+        # An existing output file is uv's preference list: listing everything
+        # the target has makes the resolver keep those versions where it can.
+        lock = Path(d) / 'lock.txt'
+        lock.write_text(''.join(f'{k}=={v.split("+")[0]}\n' for k, v in sorted(have.items())))
+        cmd = [uv, 'pip', 'compile', str(req_in), '-c', str(cons), '-o', str(lock),
+               '--python-version', pyver, '--python-platform', target,
+               '--no-header', '--no-annotate', '--quiet']
+        # Images install torch from PyTorch's own index (2.11.0+cu128): PyPI's
+        # 2.11.0 is a different build with different nvidia-* dependencies.
+        m = re.search(r'\+(cu\d+|cpu|rocm[\d.]+)$', have.get('torch', ''))
+        if m:
+            cmd += ['--torch-backend', m[1]]
+        r = run(cmd)
+        if r.returncode:
+            print(r.stderr)
+            say('could not resolve for the target')
+            return 1
+        resolved = {}
+        for line in lock.read_text().splitlines():
+            m = re.match(r'^([A-Za-z0-9._-]+)==([^\s;]+)', line)
+            if m:
+                resolved[norm(m[1])] = m[2]
+    need = {k: v for k, v in resolved.items() if have.get(k, '').split('+')[0] != v.split('+')[0]}
+    if not need:
+        say('the target already has everything these requirements resolve to')
+        return 0
+    say(f'target python {pyver} on {target}: needs ' + ', '.join(f'{k}=={v}' for k, v in sorted(need.items())))
+    failed = []
+    for name, ver in sorted(need.items()):
+        # uv resolves wheels for the target's tags; pip fetches them by tag.
+        r = run([sys.executable, '-m', 'pip', 'download', '--no-deps', '--only-binary=:all:',
+                 '--python-version', pyver, *platform_flags(glibc, env.get('machine') or 'x86_64'),
+                 '-d', str(out), '-q', f'{name}=={ver}'])
+        if r.returncode:
+            # Pure-Python sdists can be built here; anything with native code can't.
+            b = run([sys.executable, '-m', 'pip', 'wheel', '--no-deps', '-w', d, '-q', f'{name}=={ver}'])
+            built = list(Path(d).glob('*-py3-none-any.whl')) if b.returncode == 0 else []
+            if built:
+                for w in built:
+                    shutil.move(str(w), str(out / w.name))
+                continue
+            failed.append(f'{name}=={ver}')
+    wheels = sorted(p.name for p in out.glob('*.whl'))
+    say(f'{len(wheels)} wheels in {out} ({sum(p.stat().st_size for p in out.glob("*.whl")) / 1e6:.1f} MB)')
+    if failed:
+        say('no wheel for the target (needs native build; build it on the target once '
+            'with internet, or drop it): ' + ', '.join(failed))
+        return 1
+    return 0
+
+
+def platform_flags(glibc, machine):
+    """pip matches --platform tags literally: list every manylinux tag the
+    target's glibc accepts, or a manylinux_2_24 wheel is 'not found' for 2.35."""
+    major, minor = (int(x) for x in glibc.split('.')[:2])
+    tags = [f'manylinux_{major}_{m}_{machine}' for m in range(minor, 4, -1)]
+    tags += [f'manylinux2014_{machine}', f'manylinux2010_{machine}', f'manylinux1_{machine}',
+             f'linux_{machine}']
+    return [x for t in tags for x in ('--platform', t)]
+
+
+def find_wheel_dirs(root):
+    """Dataset mounts nest unpredictably; point pip at every directory that
+    holds a wheel."""
+    root = Path(root)
+    dirs = sorted({str(p.parent) for p in root.rglob('*.whl')})
+    return dirs or [str(root)]
+
+
+def write_report(a, data):
+    path = a.report or (os.environ.get('KGPU_OUTPUT_DIR') and
+                        os.path.join(os.environ['KGPU_OUTPUT_DIR'], 'envsetup.json'))
+    if path:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(data, indent=2) + '\n')
+
+
+def main():
+    p = argparse.ArgumentParser(prog='envsetup', description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('probe')
+    s.add_argument('--json', help='also write the full fingerprint here')
+    s.set_defaults(f=cmd_probe)
+    s = sub.add_parser('wheels')
+    s.add_argument('packages', nargs='*')
+    s.add_argument('-r', '--requirement', action='append', default=[])
+    s.add_argument('--env', required=True, help='the target\'s `envsetup probe --json` output')
+    s.add_argument('-o', '--output', required=True, help='directory for the wheels')
+    s.add_argument('--skip', action='append', default=[], metavar='NAME')
+    s.set_defaults(f=cmd_wheels)
+    s = sub.add_parser('install')
+    s.add_argument('packages', nargs='*')
+    s.add_argument('-r', '--requirement', action='append', default=[])
+    s.add_argument('--allow', action='append', default=[], metavar='NAME',
+                   help='let the resolver replace this preinstalled package')
+    s.add_argument('--skip', action='append', default=[], metavar='NAME',
+                   help='drop this requirement (e.g. flash-attn on a T4)')
+    s.add_argument('--wheels', help='offline: install only from this directory of wheels')
+    s.add_argument('--venv', help='create/use this venv (with system site-packages)')
+    s.add_argument('--system', action='store_true',
+                   help='on local, allow installing into the base interpreter')
+    s.add_argument('--installer', choices=['auto', 'uv', 'pip'], default='auto')
+    s.add_argument('--report', help='write a JSON report here (default: $KGPU_OUTPUT_DIR/envsetup.json)')
+    s.add_argument('--dry-run', action='store_true')
+    s.set_defaults(f=cmd_install)
+    a = p.parse_args()
+    return a.f(a)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

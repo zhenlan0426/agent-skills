@@ -95,6 +95,17 @@ is also evidence. Rough bytes per parameter:
   7B model needs about 120GB, which exceeds even G4 unless optimizer states
   are 8-bit or offloaded.
 
+## Dependencies differ per target
+
+Each target already has a CUDA build of torch (and more), and a plain
+`pip install -r requirements.txt` can silently replace it. Install project
+dependencies with `scripts/envsetup`, which pins that stack and reports what
+changed: `kgpu prepare --setup '-r requirements.txt'`, `cgpu setup SESSION --
+-r /content/proj/requirements.txt`, or locally `envsetup install --venv .venv
+-r requirements.txt`. [references/environments.md](references/environments.md)
+has what each target ships, the traps measured on each, flash-attn, and
+offline wheels for Kaggle.
+
 ## Rules for every target
 
 - Don't put secrets in source, argv, logs, or outputs. Each reference file says

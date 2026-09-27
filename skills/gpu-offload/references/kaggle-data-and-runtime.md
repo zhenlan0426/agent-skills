@@ -50,17 +50,12 @@ archive will appear in precisely the same layout: inspect its mounted files.
 
 ## Dependencies and secrets
 
-The Kaggle image includes common ML packages. Log Python, framework, CUDA, and
-device versions, and install only missing/incompatible dependencies. Use
-`--internet` when the job needs downloads; network access may be restricted by
-competition rules. Without it, attach wheels/data/model weights as inputs.
-Put setup in the project's batch entrypoint, or use an explicit shell:
-
-```bash
-kgpu prepare ./job --project ./src --owner USERNAME \
-  --accelerator NvidiaTeslaT4 --internet --run-timeout 3600 -- \
-  bash -c 'python -m pip install -r requirements.txt && python -u train.py'
-```
+The Kaggle image includes common ML packages. Install only what is missing,
+without replacing its torch stack, using `kgpu prepare --setup '-r
+requirements.txt'` ([environments.md](environments.md)). Use `--internet` when
+the job needs downloads; network access may be restricted by competition rules.
+Without it, attach wheels (`envsetup wheels`), data, and model weights as
+inputs.
 
 Use Kaggle's notebook editor **Add-ons → Secrets** to define and attach secrets
 to the relevant notebook. The installed CLI cannot manage these bindings.

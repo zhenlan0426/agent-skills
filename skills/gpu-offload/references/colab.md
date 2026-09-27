@@ -54,7 +54,7 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
 cgpu up job1 A100                              # add --high-mem for high-RAM shape
 cgpu push job1 ./myproj                        # -> /content/myproj (.git, venvs, caches excluded)
 cgpu secrets job1 kaggle hf                    # only if the job needs them
-cgpu sh job1 -- pip install -q -r /content/myproj/requirements.txt
+cgpu setup job1 -- -r /content/myproj/requirements.txt   # keeps the image's torch; see environments.md
 cgpu start job1 --cwd /content/myproj -- python train.py --epochs 3
 cgpu logs job1 -n 50                           # any time; also says running/FINISHED
 cgpu wait job1                                 # blocks; exits with the job's exit code
@@ -103,9 +103,9 @@ cgpu down job1                                 # always, once results are safe (
     good copy. Have the job likewise write each checkpoint under a temporary
     name and rename it into place, so a pull never catches half a file.
   Decide which of these to use with the user before starting a multi-hour job.
-- The image tested (September 2026) had Python 3.13 and a recent CUDA PyTorch.
-  Images change, so check `cgpu sh job1 -- pip list` before installing heavy
-  packages.
+- The image tested (September 2026) had Python 3.13 and torch 2.11+cu128.
+  Images change: `cgpu setup` prints the current fingerprint, and
+  [environments.md](environments.md) covers installing without replacing it.
 
 ## Behavior the helper works around (verified on colab-cli 0.7.4)
 

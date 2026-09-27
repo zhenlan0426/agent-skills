@@ -62,6 +62,12 @@ Use a private dataset and small bootstrap for larger projects, as described in
 the command must be an executable batch entrypoint; a notebook is not executed
 just because it is bundled.
 
+`--setup 'ARGS'` runs `envsetup install ARGS` in the kernel before the command
+(fingerprint saved as `out/env.json`, install report as `out/envsetup.json`); a
+failed install fails the job without running the command. It needs `--internet`
+or `--wheels` pointing at an attached dataset. See
+[environments.md](environments.md).
+
 Inside the job, the project is `/kaggle/working/project` and is the working
 directory. Attached inputs are under read-only `/kaggle/input`; inspect the
 actual mount paths. Write results under `/kaggle/working`, such as
