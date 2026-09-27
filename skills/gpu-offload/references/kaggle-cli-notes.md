@@ -27,7 +27,10 @@ The installed `kaggle/api/kaggle_api_extended.py` was inspected:
   verify the device actually allocated before claiming a hardware-specific test.
 - `kaggle quota` exists but crashes in 2.2.2 (`not enough values to unpack`):
   the SDK's duration parser expects fractional seconds and the server returns
-  whole ones. Read remaining GPU quota from the account UI instead.
+  whole ones. To work around it, patch
+  `kagglesdk.kaggle_object.TimeDeltaSerializer._from_dict_value` to accept
+  `"<n>s"`, then call `KaggleApi().quota_view()`. This reports GPU and TPU used
+  and total time, plus the refresh time (verified 2026-09-27).
 
 Recheck these details after a CLI upgrade; upstream main may describe unreleased
 or newer features. These workarounds are version-specific, not platform promises.
@@ -86,9 +89,12 @@ files or credentials were uploaded.
 - Accepted ref: `zhenlanwang/kgpu-20260927-135034-27e8be47cf` (private, retained).
   Downloading its saved source with `kaggle kernels pull --metadata` reproduced
   all 720,896 bytes exactly; downloaded metadata confirmed `is_private: true`.
-  GPU execution was still QUEUED after more than 15 minutes when this record
-  was written. Upload/storage is verified; remote extraction and CUDA execution
-  are not yet verified. Do not describe this as a completed GPU smoke test.
+  Version 1 stayed QUEUED for about 1h55m (13:50 to 15:45 UTC) and was
+  cancelled from the UI. The server-side metadata matched the smoke test that ran
+  (`NvidiaTeslaT4`, same docker image, private, GPU on). The status API gave no
+  failure message. A UI "Save Version" of the same source, version 2, started at
+  once and completed. The CLI-pushed version 1 never executed. See the
+  queue stall note below.
 - Local fixtures and measurements:
   `~/.cache/kgpu/large-upload-20260927/` and its `512k/` subdirectory.
   Each contains `prepare_probe.py`, `measurements.json`, `project/`, and `job/`.
@@ -98,6 +104,24 @@ files or credentials were uploaded.
   retrieves completed outputs, verifies the helper run marker, compares the
   remote and downloaded payload SHA-256 against the original, and checks the
   CUDA result. It neither submits another job nor cancels the existing one.
+
+### CLI-pushed runs stuck QUEUED — 2026-09-27
+
+After the smoke test ran, two later CLI pushes stayed QUEUED until the user
+cancelled them: `...135034-27e8be47cf` (13:50) and `...144446-991d9872ff`
+(14:44, internet on, 3600 s cap). Re-running each from the UI as version 2 at
+about 15:46 started immediately, and both completed.
+
+- Their server-side metadata matched the smoke kernel that ran. So did
+  `machine_shape`, the docker image, and the privacy and GPU flags.
+- `get_kernel_session_status` returned QUEUED with an empty `failure_message`.
+- Quota was not the cause. GPU use was about 4 minutes of 45 hours. TPU use was
+  0, so no hidden accelerator session was running.
+- Cause not established. Candidates: the account's GPU batch slot was blocked,
+  with the second job queued behind the first; or API-pushed versions are
+  scheduled differently from UI saves. Neither is proven.
+- The kagglesdk `KernelsApiClient` has `cancel_kernel_session`, but it has not
+  been exercised. Until it is, cancel stuck runs in the UI.
 
 These observations do not establish Kaggle's exact script or request limit, or
 guarantee future service acceptance. The helper now limits embedded archives to
