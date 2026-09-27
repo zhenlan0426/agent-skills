@@ -603,9 +603,11 @@ def cmd_wait(a):
 
 
 def signal_group(session, pid, sig):
-    marker = f"__CGPU_{sig}_{uuid.uuid4().hex}__"
-    failed = f"__CGPU_{sig}_MISSING__"
-    command = f"if kill -{sig} -{pid}; then echo {marker}; else echo {failed}; fi\n"
+    token = uuid.uuid4().hex
+    marker = f"__CGPU_{sig}_{token}__"
+    # The console echoes typed input, so the command must not contain the
+    # marker verbatim: the shell joins the quoted halves only when it runs.
+    command = f"if kill -{sig} -{pid}; then echo __CGPU_{sig}''_{token}__; fi\n"
     r = colab("console", "-s", session, stdin=command, capture=True,
               check=False, timeout=60)
     output = r.stdout + r.stderr
@@ -644,37 +646,36 @@ def cmd_kill(a):
     if not pid.isdigit():
         die(f"job pid file contains an invalid process id: {pid!r}")
 
+    # A lost job (kernel restarted) never writes a status, and its process
+    # may already be gone; either way the kill must be recorded so `start`
+    # can proceed.
+    status, step = None, "SIGTERM"
     sent, output = signal_group(a.session, pid, "TERM")
-    if not sent:
+    if sent:
+        status = wait_for_status(a.session, job, TERM_GRACE)
+        if status is None:
+            step = "SIGKILL"
+            sent, output = signal_group(a.session, pid, "KILL")
+            if sent:
+                status = wait_for_status(a.session, job, KILL_WAIT)
+    gone = not sent and "No such process" in output
+    if not sent and not gone:
+        die(f"could not send {step} to process group {pid}: {output.strip() or 'no confirmation'}")
+    if gone:
         status = wait_for_status(a.session, job, 1)
-        if status is not None:
-            print(f"[cgpu] job {job['id']} finished before SIGTERM (exit={status['rc']})")
-            return
-        die(f"could not send SIGTERM to process group {pid}: {output.strip() or 'no confirmation'}")
-
-    status = wait_for_status(a.session, job, TERM_GRACE)
-    if status is not None:
-        job["killed"] = True
-        save_job(a.session, job)
-        print(f"[cgpu] job {job['id']} stopped after SIGTERM (exit={status['rc']})")
-        return
-
-    sent, output = signal_group(a.session, pid, "KILL")
-    if not sent:
-        status = wait_for_status(a.session, job, 1)
-        if status is not None:
-            job["killed"] = True
-            save_job(a.session, job)
-            print(f"[cgpu] job {job['id']} finished before SIGKILL (exit={status['rc']})")
-            return
-        die(f"could not send SIGKILL to process group {pid}: {output.strip() or 'no confirmation'}")
-
-    status = wait_for_status(a.session, job, KILL_WAIT)
     job["killed"] = True  # lets `start` proceed past a lost job
     save_job(a.session, job)
-    if status is None:
-        die(f"SIGKILL sent to process group {pid}, but no final status appeared; inspect `cgpu logs {a.session}`", 3)
-    print(f"[cgpu] job {job['id']} required SIGKILL (exit={status['rc']})")
+    if status is not None:
+        how = f"finished before {step}" if gone else (
+            "required SIGKILL" if step == "SIGKILL" else "stopped after SIGTERM")
+        print(f"[cgpu] job {job['id']} {how} (exit={status['rc']})")
+    elif gone:
+        print(f"[cgpu] job {job['id']}: process group {pid} is gone; it left no exit status")
+    elif kind == "lost":
+        print(f"[cgpu] job {job['id']}: sent SIGKILL; a lost job leaves no exit status")
+    else:
+        die(f"SIGKILL sent to process group {pid}, but no final status appeared; "
+            f"inspect `cgpu logs {a.session}`", 3)
 
 
 def cmd_pull(a):

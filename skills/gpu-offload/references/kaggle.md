@@ -60,7 +60,7 @@ compressed**, **20 MiB unpacked**, and the final UTF-8 kernel script at **704 Ki
 (base64, wrapper, and command included). Preparation reports archive/script sizes
 and records them in `job.json`; submission rechecks the actual script, including
 older prepared jobs. These are local guardrails backed by the
-[live validation record](kaggle-cli-notes.md), not Kaggle's published limits:
+[live validation record](../docs/kaggle-cli-investigation.md), not Kaggle's published limits:
 a near-2 MiB bundle in a 2,800,000-byte script was rejected by the API.
 Use a private dataset and small bootstrap for larger projects, as described in
 [data and runtime](kaggle-data-and-runtime.md). A project may contain notebooks, but

@@ -220,8 +220,8 @@ class WheelBuild(unittest.TestCase):
                                    'platform_flags': lambda *a: []}):
                 with contextlib.redirect_stdout(io.StringIO()) as output_text:
                     code = es.cmd_wheels(args)
-        self.assertEqual(code, 0)
-        self.assertEqual((output / 'purepkg-1.0-py3-none-any.whl').read_bytes(), b'wheel')
+            self.assertEqual(code, 0)
+            self.assertEqual((output / 'purepkg-1.0-py3-none-any.whl').read_bytes(), b'wheel')
         self.assertTrue(created)
         self.assertTrue(all(not path.exists() for path in created))
         self.assertIn('no immutable image digest', output_text.getvalue())

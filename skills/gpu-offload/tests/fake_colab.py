@@ -43,14 +43,10 @@ def remote(vm, path):
 def rewrite(vm, code):
     # Rewrite cgpu's known remote roots only. A command may intentionally use
     # a Python interpreter under /root, which belongs to the test host.
-    roots = (("/content/", vm / "fs/content/"),
-             ("/root/.kaggle/", vm / "fs/root/.kaggle/"),
-             ("/root/.cache/huggingface/", vm / "fs/root/.cache/huggingface/"),
-             ("/tmp/cgpu-", vm / "fs/tmp/cgpu-"))
-    for old, new in roots:
+    roots = ("/content", "/root/.kaggle", "/root/.cache/huggingface", "/tmp/cgpu-")
+    for old in roots:
         for quote in ("'", '"'):
-            target = str(new).rstrip("/") + ("/" if old.endswith("/") else "")
-            code = code.replace(quote + old, quote + target)
+            code = code.replace(quote + old, quote + str(vm / "fs") + old)
     return code
 
 
@@ -183,7 +179,11 @@ def main():
                 pass
     elif cmd == "console":
         vm_dir(s)
-        subprocess.run(["bash"], stdin=sys.stdin)
+        # The real console is a tmux TTY: typed input is echoed back.
+        typed = sys.stdin.read()
+        sys.stdout.write(typed)
+        sys.stdout.flush()
+        subprocess.run(["bash"], input=typed, text=True)
     else:
         print(f"fake colab: unsupported command {cmd}")
         sys.exit(2)

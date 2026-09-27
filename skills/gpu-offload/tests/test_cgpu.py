@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 CGPU = HERE.parent / "scripts" / "cgpu"
@@ -346,6 +347,20 @@ class CgpuTest(unittest.TestCase):
         self.cgpu("kill", "s")
         self.wait_for(lambda: subprocess.run(["kill", "-0", str(pid)],
                                              capture_output=True).returncode != 0)
+        self.cgpu("start", "s", "--", "true")
+        self.cgpu("wait", "s", "--poll", "1")
+
+    def test_kill_records_lost_job_whose_process_is_gone(self):
+        self.cgpu("up", "s", "T4")
+        self.cgpu("start", "s", "--", "sleep", "300")
+        subprocess.run(["colab", "restart-kernel", "-s", "s"], env=self.env, check=True)
+        jdir = self.vm() / self.record()["dir"].lstrip("/")
+        pid = int((jdir / "pid").read_text())
+        os.killpg(pid, signal.SIGKILL)
+        time.sleep(3)
+        (jdir / "beat").write_text(repr(time.time() - 1000))
+        r = self.cgpu("kill", "s")
+        self.assertIn("is gone", r.stdout)
         self.cgpu("start", "s", "--", "true")
         self.cgpu("wait", "s", "--poll", "1")
 
