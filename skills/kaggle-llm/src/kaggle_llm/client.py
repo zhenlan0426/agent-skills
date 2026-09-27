@@ -19,12 +19,12 @@ def _slug(model):
 def resolve_model(model, values):
     model = model or values.get("LLM_DEFAULT")
     if not isinstance(model, str) or not model.strip():
-        raise KaggleLLMError("No model configured; provide model= or run kaggle-llm auth.")
+        raise KaggleLLMError("No model configured; provide model= or run kaggle-llm auth.", batch_fatal=True)
     if "/" in model:
         # The CLI's curated list can lag actual proxy access. Exact IDs are
         # forwarded unchanged; Kaggle remains the authority on availability.
         if not re.fullmatch(r"[^/\s]+/[^/\s]+", model):
-            raise ValueError("Use an exact provider/model ID without whitespace")
+            raise KaggleLLMError("Use an exact provider/model ID without whitespace", batch_fatal=True)
         return model
     available = [s.strip() for s in (values.get("LLMS_AVAILABLE") or "").split(",") if s.strip()]
     if model in available:
@@ -34,7 +34,7 @@ def resolve_model(model, values):
     )]
     if len(matches) == 1:
         return matches[0]
-    raise KaggleLLMError(f"Unknown model alias {model!r}. Run kaggle-llm models or provide the exact provider/model ID.")
+    raise KaggleLLMError(f"Unknown model alias {model!r}. Run kaggle-llm models or provide the exact provider/model ID.", batch_fatal=True)
 
 
 def _endpoint(value):
@@ -43,9 +43,16 @@ def _endpoint(value):
         if url.endswith(suffix):
             url = url[:-len(suffix)]
             break
-    parsed = urlsplit(url)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.query or parsed.fragment:
-        raise KaggleLLMError("MODEL_PROXY_URL must be an HTTPS base URL without user info, query, or fragment.")
+    try:
+        parsed = urlsplit(url)
+        valid = (parsed.scheme == "https" and parsed.hostname and parsed.port != 0
+                 and parsed.username is None and not parsed.query and not parsed.fragment
+                 and not re.search(r"[\s\\]", url))
+        httpx.URL(url)
+    except (ValueError, httpx.InvalidURL):
+        valid = False
+    if not valid:
+        raise KaggleLLMError("MODEL_PROXY_URL must be an HTTPS base URL without user info, query, or fragment.", batch_fatal=True)
     return url + "/openapi/chat/completions"
 
 
@@ -124,6 +131,13 @@ class Client:
                            ("reasoning_effort", reasoning), ("response_format", response_format)):
             if value is not None:
                 payload[key] = value
+        # Reject bad local configuration before a potentially costly refresh.
+        # Empty/missing credentials still need first-use bootstrap for aliases.
+        current = self.credentials.read()
+        if current or (isinstance(model, str) and "/" in model):
+            resolve_model(model, current)
+        if current.get("MODEL_PROXY_URL"):
+            _endpoint(current["MODEL_PROXY_URL"])
         values = self.credentials.ensure()
         for attempt in range(2):
             payload["model"] = resolve_model(model, values)
@@ -133,7 +147,9 @@ class Client:
                     headers={"Authorization": "Bearer " + values["MODEL_PROXY_API_KEY"]},
                 )
             except httpx.TimeoutException:
-                raise KaggleLLMError("Inference timed out; the server may have processed it. No automatic retry.") from None
+                raise KaggleLLMError("Inference timed out; the server may have processed it. No automatic retry.", batch_transient=True) from None
+            except httpx.InvalidURL:
+                raise KaggleLLMError("Invalid MODEL_PROXY_URL.", batch_fatal=True) from None
             except httpx.HTTPError:
                 raise KaggleLLMError("Inference connection failed. No automatic retry.") from None
             if response.status_code == 401 and attempt == 0:
@@ -149,7 +165,8 @@ class Client:
                 }
                 hint = hints.get(response.status_code, "Proxy request failed; no automatic retry.")
                 raise KaggleLLMError(f"HTTP {response.status_code}: {hint}",
-                                     batch_fatal=response.status_code in (401, 403, 429))
+                                     batch_fatal=response.status_code in (401, 403, 404, 429),
+                                     batch_transient=500 <= response.status_code < 600)
             try:
                 result = loads(response.text)
             except ValueError:
@@ -201,7 +218,7 @@ class Client:
         if schema is not None:
             candidate = text.strip()
             if candidate.startswith("```") and candidate.endswith("```"):
-                candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate)
+                candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.I)
             try:
                 structured = loads(candidate)
                 prepared.validator.validate(structured)

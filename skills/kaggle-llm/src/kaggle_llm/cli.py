@@ -1,11 +1,15 @@
 import argparse
 import json
+import math
 from pathlib import Path
 import sys
 
 from . import Client, KaggleLLMError
 from .client import _prepare_schema
 from .jsonutil import loads
+
+
+MAX_CONSECUTIVE_TRANSIENT_ERRORS = 3
 
 
 def emit(value):
@@ -40,6 +44,13 @@ def main(argv=None):
     batch.add_argument('input', help='JSONL path or - for stdin; rows contain prompt and optional id')
     _options(batch)
     args = parser.parse_args(argv)
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error('--timeout must be a positive finite number')
+    if getattr(args, 'max_tokens', None) is not None and args.max_tokens <= 0:
+        parser.error('--max-tokens must be a positive integer')
+    if getattr(args, 'temperature', None) is not None and (
+            not math.isfinite(args.temperature) or not 0 <= args.temperature <= 2):
+        parser.error('--temperature must be between 0 and 2')
     schema = None
     if getattr(args, 'schema', None) is not None:
         try:
@@ -64,6 +75,7 @@ def main(argv=None):
                     emit(result)
                 return 0
             failures = 0
+            consecutive_transient_errors = 0
             stream = sys.stdin if args.input == '-' else open(args.input, encoding='utf-8')
             try:
                 for number, line in enumerate(stream, 1):
@@ -75,14 +87,18 @@ def main(argv=None):
                         if not isinstance(row, dict) or set(row) - {'id', 'prompt'}:
                             raise ValueError('Each row must be an object with prompt and optional id')
                         row_id = row.get('id')
-                        if row_id is not None and not isinstance(row_id, (str, int)):
+                        if row_id is not None and type(row_id) not in (str, int):
                             raise ValueError('id must be a string or integer')
                         result = client.prompt(row.get('prompt'), **options)
+                        consecutive_transient_errors = 0
                         emit({'line': number, 'id': row_id, 'ok': True, 'result': result})
                     except (KaggleLLMError, ValueError) as exc:
                         failures += 1
                         emit({'line': number, 'id': row_id, 'ok': False, 'error': str(exc)})
-                        if isinstance(exc, KaggleLLMError) and exc.batch_fatal:
+                        transient = isinstance(exc, KaggleLLMError) and exc.batch_transient
+                        consecutive_transient_errors = consecutive_transient_errors + 1 if transient else 0
+                        if ((isinstance(exc, KaggleLLMError) and exc.batch_fatal)
+                                or consecutive_transient_errors >= MAX_CONSECUTIVE_TRANSIENT_ERRORS):
                             print('Batch stopped; remaining rows were not sent.', file=sys.stderr)
                             break
             finally:

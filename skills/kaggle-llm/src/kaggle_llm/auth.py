@@ -14,9 +14,10 @@ from dotenv import dotenv_values
 class KaggleLLMError(RuntimeError):
     """A safe-to-display failure; excludes credentials and upstream request bodies."""
 
-    def __init__(self, message, *, batch_fatal=False):
+    def __init__(self, message, *, batch_fatal=False, batch_transient=False):
         super().__init__(message)
         self.batch_fatal = batch_fatal
+        self.batch_transient = batch_transient
 
 
 def default_env_file():
