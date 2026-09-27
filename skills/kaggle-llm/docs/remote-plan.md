@@ -55,7 +55,7 @@ Test task: `zhenlanwang/kaggle-llm-runner`, version 1, private. Source is in
 ### 3.1 Execution model
 
 One job = **one push** of a generated task file to the fixed private slug
-`kaggle-llm-runner`. The creation run executes the job: it ignores the default
+`kaggle-llm-batch` (was `kaggle-llm-runner`; see the incident in section 6). The creation run executes the job: it ignores the default
 `llm` and calls the target model itself over the proxy. There is no separate `run -m`,
 so each prompt is sent exactly once.
 
@@ -183,7 +183,7 @@ each line under a lock:
 ### 3.6 `remote.py`
 
 ```python
-SLUG = "kaggle-llm-runner"
+SLUG = "kaggle-llm-batch"
 RESULTS_NAME = "kaggle_llm_results.jsonl"
 DEFAULT_DEADLINE = 39600     # placeholder; set from experiment E2
 
@@ -413,8 +413,8 @@ the summaries into the log.
 
 ## 5. Live experiments (Phase 2)
 
-Push with `kaggle b t push kaggle-llm-runner -f task.py --wait 7200 --poll-interval 10`,
-where `task.py = render_task(spec)`, then run `kaggle b t download kaggle-llm-runner -o <dir>`.
+Push with `kaggle b t push kaggle-llm-batch -f task.py --wait 7200 --poll-interval 10`,
+where `task.py = render_task(spec)`, then run `kaggle b t download kaggle-llm-batch -o <dir>`.
 Every push adds a permanent private version. Keep experiments minimal.
 
 | # | Question | Procedure | Record / decide |
@@ -469,6 +469,27 @@ Every push adds a permanent private version. Keep experiments minimal.
 - Read-only re-checks at 19:00Z, 19:01Z, 19:02Z, then every 2 min until
   19:33Z: still 403. E2, E3, E4, E5 and Phase 5 are blocked until access is
   restored.
+- 19:37Z: `kaggle b t models` works, so only task access is denied. The user
+  reports the task page `kaggle.com/benchmarks/tasks/zhenlanwang/kaggle-llm-runner`
+  shows "We can't find that page": the task appears deleted or removed on
+  Kaggle's side (cause unknown; it followed the refused 4 MB push).
+- 19:41:08Z, with the user's go-ahead to set a task up: a minimal dry-run push
+  (1 row, no model calls, 9 KB, job `1252a0a3f5ec`) to `kaggle-llm-runner`
+  failed server-side: `Failed to push task. Error: Object reference not set to
+  an instance of an object.` The old name seems stuck.
+- 19:41:24Z: the same dry run under the new slug **`kaggle-llm-batch`** (job
+  `7752f782fd78`) succeeded. Creation finished at 19:42:50Z (86 s; run 3326150 on
+  `gemini-3.7-flash`), and status shows version 1, Completed, `Public: False`.
+- First live check of `SdkBackend`, read-only: `task()` returned
+  `TaskInfo(version=1, state='completed', error=None, is_public=False)`; `runs()`
+  returned `[RunInfo(3326150, 'gemini-3.7-flash', 'completed')]`; `download()`
+  fetched `kaggle_llm_results.jsonl` plus Kaggle's `run/result/atif/task.json`,
+  and the job line's `job_id` matched. `task('kaggle-llm-runner')` raises
+  `HTTP 403 (benchmark task access denied ...)` instead of returning `None`, as
+  intended.
+- Decision: `SLUG = "kaggle-llm-batch"`. SKILL.md, api.md and the forward-looking
+  mentions in this plan were updated. Section 2's facts about
+  `kaggle-llm-runner` are kept as history.
 
 ### Phases 1, 3, 4: implementation notes (2026-09-27)
 - All contract classes pass (`PYTHONPATH=src python3 -m unittest discover -s
@@ -524,7 +545,7 @@ Every push adds a permanent private version. Keep experiments minimal.
 4. `--max-cost 0.001`. Expect: `stopped_reason: max_cost`, most rows
    "not run", exit 1. Then `remote resume <id>` with a higher cap; `collect`
    returns all rows ok with the original line numbers.
-5. `kaggle b t status kaggle-llm-runner` still shows `Public: False`.
+5. `kaggle b t status kaggle-llm-batch` still shows `Public: False`.
 6. Local mode is unchanged: `kaggle-llm batch small.jsonl` (no `--remote`)
    behaves as before.
 

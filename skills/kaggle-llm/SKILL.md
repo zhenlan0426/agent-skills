@@ -30,7 +30,7 @@ For Python usage, installation, schemas, and failure handling, read [references/
 
 ## Remote batch (top models)
 
-Local tokens reach only a small curated model set. `kaggle-llm batch input.jsonl --remote` instead runs the batch inside a private Kaggle benchmark task (`kaggle-llm-runner`), whose kernel can call the full catalog (GPT-6 Astra, Claude Opus 5, ...). Use it only when the user wants catalog models that local access cannot reach, typically for fine-tuning data; otherwise use local `batch`.
+Local tokens reach only a small curated model set. `kaggle-llm batch input.jsonl --remote` instead runs the batch inside a private Kaggle benchmark task (`kaggle-llm-batch`), whose kernel can call the full catalog (GPT-6 Astra, Claude Opus 5, ...). Use it only when the user wants catalog models that local access cannot reach, typically for fine-tuning data; otherwise use local `batch`.
 
 - **Tell the user first:** prompts and responses are stored **permanently** in their Kaggle account. The task is private, but Kaggle cannot delete tasks. The CLI verifies the task is private after every push and fails loudly if not; never run `kaggle b t publish` on it.
 - Model: without `--model`, the kernel probes the ranked catalog and pins the first model that answers; with it, only that model is tried. The pinned model is reported in the summary and every envelope; there is no substitution mid-job. Provider terms (OpenAI, Anthropic) restrict using outputs to train competing models; open-weight catalog models (Qwen, DeepSeek, GLM) are an alternative. That is the user's call.

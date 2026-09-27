@@ -105,7 +105,7 @@ Envelopes preserve upstream usage/cost fields without estimating absent values. 
 
 ## Remote batches
 
-`kaggle-llm batch INPUT --remote` runs a batch inside the private Kaggle benchmark task `kaggle-llm-runner` in the current Kaggle login's account. Kernels there can call the whole benchmark catalog, which local tokens cannot. Design notes and the experiment log are in [docs/remote-plan.md](../docs/remote-plan.md).
+`kaggle-llm batch INPUT --remote` runs a batch inside the private Kaggle benchmark task `kaggle-llm-batch` in the current Kaggle login's account. Kernels there can call the whole benchmark catalog, which local tokens cannot. Design notes and the experiment log are in [docs/remote-plan.md](../docs/remote-plan.md).
 
 ```bash
 kaggle-llm batch prompts.jsonl --remote --max-cost 2 > out.jsonl

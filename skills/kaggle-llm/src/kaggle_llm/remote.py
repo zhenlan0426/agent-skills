@@ -29,7 +29,7 @@ from .auth import KaggleLLMError
 from .client import _PreparedSchema, _prepare_schema, build_request, finish, resolve_model
 from .dedup import near_duplicates
 
-SLUG = "kaggle-llm-runner"
+SLUG = "kaggle-llm-batch"  # kaggle-llm-runner broke server-side on 2026-09-27; see the plan log
 RESULTS_NAME = "kaggle_llm_results.jsonl"
 DEFAULT_DEADLINE = 39600     # placeholder; set from experiment E2
 DEFAULT_WAIT_TIMEOUT = 3600  # CLI wait before detaching; the job keeps running on Kaggle
