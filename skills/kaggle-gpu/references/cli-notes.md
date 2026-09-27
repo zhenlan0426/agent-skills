@@ -10,7 +10,7 @@ The installed `kaggle/api/kaggle_api_extended.py` was inspected:
   to `kernel-metadata.json` are not uploaded as a project directory. `kgpu`
   embeds the project in the code file to transport small multi-file projects.
 - `kernels_push_cli` can print `Kernel push error: ...` and return exit zero.
-  The helper requires the numbered successful-push response too, and flags
+  The helper requires a successful-push response (with or without a version number), and flags
   rejected data sources even when a run was accepted.
 - `kernels_status`, `kernels_logs`, and `kernels_output` parse a version suffix
   but do not send it in the API request. Use a unique kernel per job; never
@@ -67,6 +67,53 @@ This verifies the small embedded-source path through GPU execution and final
 download. Large dataset uploads, secret binding, long runs, cancellation, and
 checkpoint recovery were not exercised by this test.
 
+### Large embedded upload test — 2026-09-27
+
+Two private T4 submissions were attempted with CLI 2.2.2, internet disabled,
+and a 300-second remote runtime cap. Each fixture contained generated Python,
+deterministic incompressible bytes, and an expected SHA-256 digest. A trailing
+comment padded the generated source to the stated test size. No real project
+files or credentials were uploaded.
+
+| Attempt | ZIP bytes | Base64 bytes | Final source bytes | Submission |
+| --- | ---: | ---: | ---: | --- |
+| Near old 2 MiB cap | 2,097,151 | 2,796,204 | 2,800,000 | HTTP 400 Bad Request |
+| Near new 512 KiB cap | 524,285 | 699,048 | 720,896 (704 KiB) | Version 1 accepted |
+
+- Rejected ref: `zhenlanwang/kgpu-20260927-134950-00d9045fa7`.
+  A subsequent status query returned HTTP 404. The CLI exposed no detailed
+  rejection reason. The original attempted directory was not resubmitted.
+- Accepted ref: `zhenlanwang/kgpu-20260927-135034-27e8be47cf` (private, retained).
+  Downloading its saved source with `kaggle kernels pull --metadata` reproduced
+  all 720,896 bytes exactly; downloaded metadata confirmed `is_private: true`.
+  GPU execution was still QUEUED after more than 15 minutes when this record
+  was written. Upload/storage is verified; remote extraction and CUDA execution
+  are not yet verified. Do not describe this as a completed GPU smoke test.
+- Local fixtures and measurements:
+  `~/.cache/kgpu/large-upload-20260927/` and its `512k/` subdirectory.
+  Each contains `prepare_probe.py`, `measurements.json`, `project/`, and `job/`.
+  The fixture script prepares locally; it does not submit automatically.
+  `512k/live-result.json` and `512k/monitor.log` record subsequent execution
+  status. A detached local monitor polls this same job for up to two hours,
+  retrieves completed outputs, verifies the helper run marker, compares the
+  remote and downloaded payload SHA-256 against the original, and checks the
+  CUDA result. It neither submits another job nor cancels the existing one.
+
+These observations do not establish Kaggle's exact script or request limit, or
+guarantee future service acceptance. The helper now limits embedded archives to
+512 KiB and final UTF-8 source to 704 KiB; the latter includes the base64 payload,
+wrapper, and command. This also protects against wrapper growth and long argv.
+`prepare` records sizes, and `submit` checks the current source before recording
+an attempt or contacting Kaggle, including for jobs prepared by older helpers.
+HTTP errors and partial CLI timeout output are retained in `submission.log`;
+ambiguous submissions still cannot be blindly retried.
+
+Offline regressions cover an incompressible archive near the new cap, byte-for-byte
+extraction, a real oversized archive, UTF-8 command growth, source-size checks at
+submit, the exact source boundary, and diagnostics retained after failed requests.
+Larger projects must use the private-dataset/bootstrap path in
+[data and runtime](data-and-runtime.md). Dataset transport was not live-tested here.
+
 ## Upstream references
 
 - [Kernel CLI commands](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md)
@@ -74,5 +121,5 @@ checkpoint recovery were not exercised by this test.
 - [Official CLI source](https://github.com/Kaggle/kaggle-cli/blob/main/src/kaggle/api/kaggle_api_extended.py)
 - [Dataset metadata](https://github.com/Kaggle/kaggle-cli/blob/main/docs/datasets_metadata.md)
 
-The helper's 2 MiB compressed / 20 MiB unpacked source limits are conservative
-local packaging limits. They are not measured Kaggle upload limits.
+The 20 MiB unpacked limit remains a local packaging guardrail. It is separate
+from the transport envelope tested above.
