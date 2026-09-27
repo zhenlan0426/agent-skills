@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kaggle LLM"
+  short_description: "Call Kaggle models from Python, CLI, and batches"
+  default_prompt: "Use $kaggle-llm to call a Kaggle model from a script with validated JSON output."
