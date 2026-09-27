@@ -124,13 +124,7 @@ class Client:
                     or message["role"] not in ("system", "user", "assistant")
                     or not isinstance(message["content"], str)):
                 raise ValueError("Each message must contain only role (system/user/assistant) and text content")
-        if max_tokens is not None and (type(max_tokens) is not int or max_tokens <= 0):
-            raise ValueError("max_tokens must be a positive integer")
-        if temperature is not None and (not isinstance(temperature, (int, float))
-                                       or not math.isfinite(temperature) or not 0 <= temperature <= 2):
-            raise ValueError("temperature must be between 0 and 2")
-        if reasoning is not None and reasoning not in ("none", "minimal", "low", "medium", "high"):
-            raise ValueError("Unsupported reasoning effort")
+        _check_options(max_tokens, temperature, reasoning)
         if model is None:
             model = self.best_model()
         payload = {"messages": messages, "stream": False}
@@ -184,56 +178,90 @@ class Client:
                 raise KaggleLLMError("Proxy returned no completion choices.")
             return result
 
-    def prompt(self, prompt, *, system=None, schema=None, schema_mode="prompt", **options):
+    def prompt(self, prompt, *, system=None, schema=None, schema_mode="prompt", model=None,
+               max_tokens=None, temperature=None, reasoning=None, **options):
         """Return text, structured_output, model, usage and finish_reason.
 
         schema_mode='prompt' requests JSON in the prompt and validates locally.
         'native' additionally sends response_format=json_schema (model dependent).
         Invalid/truncated output raises; it is never silently accepted or retried.
         """
-        if not isinstance(prompt, str) or not prompt:
-            raise ValueError("prompt must be a nonempty string")
-        if system is not None and not isinstance(system, str):
-            raise ValueError("system must be text")
-        if schema_mode not in ("prompt", "native"):
-            raise ValueError("schema_mode must be prompt or native")
-        if schema is not None:
-            prepared = _prepare_schema(schema)
-            prompt += "\n\nReturn only valid JSON satisfying this schema (no markdown):\n" + prepared.encoded
-            if schema_mode == "native":
-                options["response_format"] = {"type": "json_schema", "json_schema": {
-                    "name": "result", "strict": True, "schema": prepared.schema,
-                }}
-        messages = ([{"role": "system", "content": system}] if system is not None else [])
-        messages.append({"role": "user", "content": prompt})
-        raw = self.chat(messages, **options)
+        messages, payload, prepared = build_request(
+            prompt, system=system, schema=schema, schema_mode=schema_mode,
+            max_tokens=max_tokens, temperature=temperature, reasoning=reasoning)
+        if "response_format" in payload:
+            options["response_format"] = payload["response_format"]
+        raw = self.chat(messages, model=model, max_tokens=max_tokens, temperature=temperature,
+                        reasoning=reasoning, **options)
+        return finish(raw, prepared)
+
+
+def _check_options(max_tokens, temperature, reasoning):
+    if max_tokens is not None and (type(max_tokens) is not int or max_tokens <= 0):
+        raise ValueError("max_tokens must be a positive integer")
+    if temperature is not None and (not isinstance(temperature, (int, float))
+                                   or not math.isfinite(temperature) or not 0 <= temperature <= 2):
+        raise ValueError("temperature must be between 0 and 2")
+    if reasoning is not None and reasoning not in ("none", "minimal", "low", "medium", "high"):
+        raise ValueError("Unsupported reasoning effort")
+
+
+def build_request(prompt, *, system=None, schema=None, schema_mode="prompt", max_tokens=None,
+                  temperature=None, reasoning=None):
+    """Return (messages, payload options, prepared schema or None) exactly as Client.prompt sends them."""
+    if not isinstance(prompt, str) or not prompt:
+        raise ValueError("prompt must be a nonempty string")
+    if system is not None and not isinstance(system, str):
+        raise ValueError("system must be text")
+    if schema_mode not in ("prompt", "native"):
+        raise ValueError("schema_mode must be prompt or native")
+    _check_options(max_tokens, temperature, reasoning)
+    options = {}
+    for key, value in (("max_tokens", max_tokens), ("temperature", temperature), ("reasoning_effort", reasoning)):
+        if value is not None:
+            options[key] = value
+    prepared = None
+    if schema is not None:
+        prepared = _prepare_schema(schema)
+        prompt += "\n\nReturn only valid JSON satisfying this schema (no markdown):\n" + prepared.encoded
+        if schema_mode == "native":
+            options["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": "result", "strict": True, "schema": prepared.schema,
+            }}
+    messages = ([{"role": "system", "content": system}] if system is not None else [])
+    messages.append({"role": "user", "content": prompt})
+    return messages, options, prepared
+
+
+def finish(raw, prepared):
+    """Turn a raw completion into Client.prompt's envelope; raise KaggleLLMError on unusable output."""
+    try:
+        choice = raw["choices"][0]
+        message = choice["message"]
+        finish_reason = choice.get("finish_reason")
+        if message.get("refusal") or finish_reason == "content_filter":
+            raise KaggleLLMError("Model refused or filtered the request.")
+        if finish_reason == "length":
+            raise KaggleLLMError("Output was truncated; increase max_tokens before retrying.")
+        text = message.get("content")
+        # Some models include reasoning by default, even without an effort option.
+        if isinstance(text, str):
+            text = re.sub(r"^\s*<think>.*?</think>\s*", "", text, count=1, flags=re.S)
+        if not isinstance(text, str) or not text.strip():
+            raise KaggleLLMError("Model returned no text content.")
+    except (TypeError, KeyError, IndexError, AttributeError):
+        raise KaggleLLMError("Malformed completion response.") from None
+    structured = None
+    if prepared is not None:
+        candidate = text.strip()
+        if candidate.startswith("```") and candidate.endswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.I)
         try:
-            choice = raw["choices"][0]
-            message = choice["message"]
-            finish = choice.get("finish_reason")
-            if message.get("refusal") or finish == "content_filter":
-                raise KaggleLLMError("Model refused or filtered the request.")
-            if finish == "length":
-                raise KaggleLLMError("Output was truncated; increase max_tokens before retrying.")
-            text = message.get("content")
-            # Some models include reasoning by default, even without an effort option.
-            if isinstance(text, str):
-                text = re.sub(r"^\s*<think>.*?</think>\s*", "", text, count=1, flags=re.S)
-            if not isinstance(text, str) or not text.strip():
-                raise KaggleLLMError("Model returned no text content.")
-        except (TypeError, KeyError, IndexError, AttributeError):
-            raise KaggleLLMError("Malformed completion response.") from None
-        structured = None
-        if schema is not None:
-            candidate = text.strip()
-            if candidate.startswith("```") and candidate.endswith("```"):
-                candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.I)
-            try:
-                structured = loads(candidate)
-                prepared.validator.validate(structured)
-            except (ValueError, jsonschema.ValidationError):
-                raise KaggleLLMError("Model output is invalid JSON or does not match the supplied schema.") from None
-            except Exception:
-                raise KaggleLLMError("JSON Schema validation failed; check local references and schema compatibility.") from None
-        return {"text": text, "structured_output": structured, "model": raw.get("model"),
-                "usage": raw.get("usage", {}), "finish_reason": finish, "id": raw.get("id")}
+            structured = loads(candidate)
+            prepared.validator.validate(structured)
+        except (ValueError, jsonschema.ValidationError):
+            raise KaggleLLMError("Model output is invalid JSON or does not match the supplied schema.") from None
+        except Exception:
+            raise KaggleLLMError("JSON Schema validation failed; check local references and schema compatibility.") from None
+    return {"text": text, "structured_output": structured, "model": raw.get("model"),
+            "usage": raw.get("usage", {}), "finish_reason": finish_reason, "id": raw.get("id")}

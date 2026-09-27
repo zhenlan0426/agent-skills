@@ -103,9 +103,44 @@ Schema files are read as UTF-8 and checked once before processing begins. An inv
 
 Envelopes preserve upstream usage/cost fields without estimating absent values. Keep result files private when handling private data. No prompt/result files are created automatically. Captured bootstrap output and raw upstream error bodies are not relayed because they may contain credentials or prompt content.
 
+## Remote batches
+
+`kaggle-llm batch INPUT --remote` runs a batch inside the private Kaggle benchmark task `kaggle-llm-runner` in the current Kaggle login's account. Kernels there can call the whole benchmark catalog, which local tokens cannot. Design notes and the experiment log are in [docs/remote-plan.md](../docs/remote-plan.md).
+
+```bash
+kaggle-llm batch prompts.jsonl --remote --max-cost 2 > out.jsonl
+kaggle-llm batch prompts.jsonl --remote --model openai/gpt-6-astra --schema schema.json --max-cost 5
+kaggle-llm batch prompts.jsonl --remote --detach          # {"job_id": "..."}
+kaggle-llm remote status JOB                              # summary JSON, local state only
+kaggle-llm remote collect JOB [--wait-timeout S]          # waits if needed, then rows on stdout
+kaggle-llm remote resume JOB [--max-cost USD] [--concurrency N] [--detach] [--wait-timeout S]
+kaggle-llm remote list
+```
+
+Flags: `--model`, `--system`, `--schema`, `--schema-mode`, `--max-tokens`, `--temperature` and `--reasoning` behave as in local batch. Remote-only: `--concurrency` (1-16, default 4), `--max-cost USD` (> 0), `--no-dedup`, `--detach`, `--wait-timeout` (default 3600 s), and `--execute-in creation|run`. Remote-only flags without `--remote` are usage errors (exit 2).
+
+**What happens.** Every input row is validated first (object with nonempty string `prompt` and optional string/integer `id`). Any invalid row is a usage error (exit 2) and nothing is sent; local batch instead emits error rows. Near-duplicate prompts (5-word shingle Jaccard ≥ 0.85 after casefolding and removing punctuation; exact match for prompts under 5 words) are dropped, keeping the first occurrence, and listed on stderr as `{"dropped_duplicate": {"line", "id", "duplicate_of_line", "similarity"}}`. Messages and generation options are built exactly as `Client.prompt` builds them. The job is written to `~/.cache/kaggle-llm/jobs/<job_id>/` (override with `KAGGLE_LLM_JOBS_DIR`; directories are 0700), rendered to a percent-format task file (`task.py`, with the spec gzip+base64 embedded), and pushed as a new task version. Kaggle executes a pushed version once on creation. That creation run is the job: it ignores the default model and calls the proxy directly over HTTP.
+
+**In the kernel.** The runner probes the candidates in order with a 256-token "Reply with OK.": your `--model` (exact ID, or a bare alias resolved against the live catalog), or else the catalog ranked as in `best` (Claude = OpenAI > Gemini). 429, 5xx, and timeouts are retried up to 4 attempts with 5/10/20 s backoff; other failures move to the next candidate. The first model that answers is pinned for every row. If none answers, no rows run (`stopped_reason: no_model`). Rows use the same retry rule and then fail. Before each row starts, the runner stops dispatching if spend has reached `--max-cost` (probe included; cost is the proxy's `usage.cost` nanodollar fields) or the kernel deadline has passed. In-flight rows finish; undispatched rows are reported `not run (stopped: <reason>)`. The kernel's proxy credentials never leave Kaggle and are never written to results.
+
+**Results.** The CLI polls (5 s growing to 10 s) until the run finishes, downloads it, checks that the results belong to this job, and post-processes each response locally with the same rules as `Client.prompt`: refusal, truncation, `<think>` stripping, schema validation. Output rows are exactly local batch rows: `{"line", "id", "ok": true, "result": {...}}` or `{"line", "id", "ok": false, "error": "..."}`, in input order, with original line numbers. Kernel failures read `HTTP 429 after 4 attempts`. Successful rows whose text is a near-duplicate of an earlier successful row get `"near_duplicate_of": <earlier id>` and `"near_duplicate_of_line"`, and are kept. A summary goes to stderr: `{"job_id", "status", "model", "cost_usd", "rows_ok", "rows_failed", "rows_not_run", "dropped_duplicates", "stopped_reason"}`. Exit codes: 0 if every row is ok, 1 otherwise or on errors, 2 for usage errors, 130 on Ctrl-C.
+
+**Recovery.** Ctrl-C while waiting prints `job <id> continues on Kaggle; collect with: kaggle-llm remote collect <id>`. `--wait-timeout` expiry exits 1 with the same hint. The job keeps running and nothing is lost. `remote resume JOB` creates and submits a child job with only the rows that failed (including local schema failures) or never ran, with the same model candidates and options. `--max-cost` and `--concurrency` override the parent's. Collecting a child merges its whole lineage: the earliest successful result per line wins. A creation failure saves the first 200 log lines to `<job dir>/creation.log`.
+
+**Limits.**
+- Kaggle rejects task notebooks of 1 MB or more. A job holds about 950 KB of compressed prompts (roughly 1000 prompts averaging 1.9 KB); larger inputs fail before pushing and must be split into several files.
+- One job at a time: a push is refused while the previous version is still being created, and the CLI reports which local job holds it.
+- Latency: about 75 s of Kaggle overhead per job plus the calls.
+
+**Privacy and permanence.** Prompts, responses, and full conversation logs are stored in the Kaggle task (Kaggle also keeps its own run files), privately and permanently: Kaggle cannot delete tasks. After every push the CLI checks that the task and its backing notebook are private and fails loudly otherwise. It never publishes. Local job directories hold the same data; delete them when no longer needed.
+
+**Fallback.** `--execute-in run` makes the creation run a no-op and schedules a separate `kaggle b t run -m <model>` for the pinned model. Use it only if creation runs lose full-catalog access (every candidate 403/404 in the probe).
+
+Python: `from kaggle_llm import remote`, then `remote.prepare_job(rows, catalog=...)`, `JobStore().create(...)`, `remote.submit/wait/collect/resume/summary(store, [backend,] job_id)`, with `remote.default_backend()` as the Kaggle backend.
+
 ## Scope and sources
 
-This is a synchronous client for Kaggle-authorized local model access, not a hosted endpoint or unrestricted access to the full catalog. It does not upload, publish, or create tasks. Remote task execution would be a separate workflow with notebook latency and persisted task data.
+This is a synchronous client for Kaggle-authorized local model access, not a hosted endpoint. Local calls do not upload, publish, or create tasks. Only `batch --remote` creates task versions, always private, and it never publishes.
 
 Implementation checked against:
 
@@ -113,4 +148,4 @@ Implementation checked against:
 - [Official ModelProxy source](https://github.com/Kaggle/kaggle-benchmarks/blob/main/src/kaggle_benchmarks/kaggle/model_proxy.py): base URL plus `/openapi`, bearer credentials, compatible client.
 - [Official proxy adapter](https://github.com/Kaggle/kaggle-benchmarks/blob/main/src/kaggle_benchmarks/actors/proxy_openai.py): call shape and model-dependent parameters.
 
-The upstream skill's interactive benchmark-authoring workflow is not imported; this skill covers local inference only.
+The upstream skill's interactive benchmark-authoring workflow is not imported; this skill covers inference only.

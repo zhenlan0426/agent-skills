@@ -1,11 +1,9 @@
 """Executable contract for the remote batch backend. See docs/remote-plan.md.
 
-Skipped until the new modules exist. Phase 1 deletes the SkipTest guard below;
-each test class names the phase that must make it pass. Change a test only when
+Each test class names the phase that must make it pass. Change a test only when
 a live experiment disproves its assumption, and record why in the plan's log.
 """
 import ast
-import importlib.util
 import io
 import json
 import os
@@ -22,14 +20,10 @@ from unittest.mock import patch
 
 import httpx
 
-if not all(importlib.util.find_spec(name) for name in (
-        'kaggle_llm.dedup', 'kaggle_llm.remote', 'kaggle_llm.remote_runner')):
-    raise unittest.SkipTest('remote backend not implemented yet (docs/remote-plan.md, Phase 1)')
-
-from kaggle_llm import Client, KaggleLLMError, remote, remote_runner  # noqa: E402
-from kaggle_llm.cli import main  # noqa: E402
-from kaggle_llm.client import build_request, finish  # noqa: E402
-from kaggle_llm.dedup import near_duplicates, normalize  # noqa: E402
+from kaggle_llm import Client, KaggleLLMError, remote, remote_runner
+from kaggle_llm.cli import main
+from kaggle_llm.client import build_request, finish
+from kaggle_llm.dedup import near_duplicates, normalize
 
 TOP = 'openai/gpt-6-astra'
 OPUS = 'anthropic/claude-opus-5@default'
@@ -476,6 +470,11 @@ class PrepareJobTests(unittest.TestCase):
         spec, _ = remote.prepare_job(self.ROWS, catalog=self.CATALOG, schema=schema, schema_mode='native')
         self.assertEqual(spec['options']['response_format']['json_schema']['schema'], schema)
         self.assertEqual(spec['local'], {'schema': schema, 'schema_mode': 'native'})
+
+    def test_payload_over_kaggle_limit_is_refused(self):
+        # E1: Kaggle rejects task notebooks of 1 MB or more at push time.
+        with patch.object(remote, 'MAX_PAYLOAD_BYTES', 100), self.assertRaisesRegex(KaggleLLMError, 'too large'):
+            remote.prepare_job(self.ROWS, catalog=self.CATALOG)
 
 
 # Phase 3 ---------------------------------------------------------------------

@@ -1,11 +1,11 @@
 ---
 name: kaggle-llm
-description: Call LLMs through the Kaggle Benchmarks Model Proxy from Python, a CLI, or JSONL batches. Use when the user requests Kaggle-backed API-style inference, structured extraction, or a script using Kaggle model access. Not for creating or publishing benchmark tasks, GPU notebooks, or generic batch work where another provider was chosen.
+description: Call LLMs through the Kaggle Benchmarks Model Proxy from Python, a CLI, or JSONL batches, locally or as a remote batch on Kaggle's full model catalog. Use when the user requests Kaggle-backed API-style inference, structured extraction, a script using Kaggle model access, or Kaggle top-model batch generation such as fine-tuning data. Not for authoring or publishing benchmark tasks, GPU notebooks, or generic batch work where another provider was chosen.
 ---
 
 # Kaggle LLM
 
-Use the installed `kaggle-llm` command or bundled `kaggle_llm.Client` Python package. This wraps the same local Model Proxy used by the official [write-kaggle-benchmarks skill](https://github.com/Kaggle/kaggle-skills/blob/main/write-kaggle-benchmarks/SKILL.md). No benchmark task or notebook is created.
+Use the installed `kaggle-llm` command or bundled `kaggle_llm.Client` Python package. This wraps the same local Model Proxy used by the official [write-kaggle-benchmarks skill](https://github.com/Kaggle/kaggle-skills/blob/main/write-kaggle-benchmarks/SKILL.md). Local calls create no benchmark task or notebook; only the opt-in `batch --remote` does (see below).
 
 Requires Unix (Linux/macOS); credential locking uses `fcntl`, so Windows is not supported.
 
@@ -22,11 +22,22 @@ kaggle-llm batch input.jsonl > results.jsonl
 
 Run `kaggle-llm best` (Python: `Client.best_model()`) every time you are about to use LLM API access through this skill, and report the model it returns. It picks the best model this account can actually call: Claude = OpenAI > Gemini, newest major version first, then largest size (Opus/Pro/full GPT > Sonnet/Flash/mini > Haiku/Lite/nano), then newest point release. Candidates come from Kaggle's live benchmark catalog plus the curated `LLMS_AVAILABLE`; each is probed with a tiny prompt in rank order and the first that answers wins. Other providers and open-weight models are never candidates.
 
-The pick is cached for 24 hours next to the credential file. `prompt` and `batch` use it whenever `--model` is omitted (a batch resolves it once, so every row uses the same model), as does `Client.prompt`/`chat` with `model=None`. A 403/404 on the cached model drops the cache so the next call reselects. Use `kaggle-llm best --refresh` after Kaggle adds models or when access changes. Only pass `--model` when the user asks for a specific model. Never substitute models or route through remote benchmark tasks silently; see [references/api.md](references/api.md) for model resolution details.
+The pick is cached for 24 hours next to the credential file. `prompt` and `batch` use it whenever `--model` is omitted (a batch resolves it once, so every row uses the same model), as does `Client.prompt`/`chat` with `model=None`. A 403/404 on the cached model drops the cache so the next call reselects. Use `kaggle-llm best --refresh` after Kaggle adds models or when access changes. Only pass `--model` when the user asks for a specific model. Never substitute models or use `--remote` without the user choosing it; see [references/api.md](references/api.md) for model resolution details.
 
 Single-call stdout is a JSON envelope containing `text`, `structured_output`, `usage`, `model`, `finish_reason`, and `id`. Use `--text` for plain text. Inputs can be `-p`, `--file`, or `--stdin`. JSONL input rows contain `prompt` and optional `id`; output has one success/error row per processed nonblank input line. A batch continues after ordinary row errors, but stops after invalid model/endpoint configuration, credential refresh failure, 403, 404, 429, or a 401 that persists after refresh. It also stops after three consecutive rows fail with timeouts or HTTP 5xx errors (mixed failures count together); other row outcomes reset that count. Remaining rows are not sent or emitted. It exits 1 if any row failed; successful rows must not be replayed automatically.
 
 For Python usage, installation, schemas, and failure handling, read [references/api.md](references/api.md).
+
+## Remote batch (top models)
+
+Local tokens reach only a small curated model set. `kaggle-llm batch input.jsonl --remote` instead runs the batch inside a private Kaggle benchmark task (`kaggle-llm-runner`), whose kernel can call the full catalog (GPT-6 Astra, Claude Opus 5, ...). Use it only when the user wants catalog models that local access cannot reach, typically for fine-tuning data; otherwise use local `batch`.
+
+- **Tell the user first:** prompts and responses are stored **permanently** in their Kaggle account. The task is private, but Kaggle cannot delete tasks. The CLI verifies the task is private after every push and fails loudly if not; never run `kaggle b t publish` on it.
+- Model: without `--model`, the kernel probes the ranked catalog and pins the first model that answers; with it, only that model is tried. The pinned model is reported in the summary and every envelope; there is no substitution mid-job. Provider terms (OpenAI, Anthropic) restrict using outputs to train competing models; open-weight catalog models (Qwen, DeepSeek, GLM) are an alternative. That is the user's call.
+- Expect about 75 s of Kaggle overhead per job plus the calls, which run with `--concurrency` (default 4). One job at a time: a push is refused while another job's task is still being created. A job holds up to about 950 KB of compressed prompts (roughly 1000 prompts averaging 1.9 KB); split larger files.
+- Near-duplicate prompts are dropped before sending (listed on stderr; `--no-dedup` keeps them). Near-duplicate responses are flagged with `near_duplicate_of`, never dropped. Output rows match local `batch`; exit 0 only if every row is ok.
+- Always pass `--max-cost USD` for anything but tiny jobs. When spend reaches it, remaining rows are not sent and come back as `not run (stopped: max_cost)`.
+- Recovery: `--detach` prints `{"job_id": ...}` right after the push. Ctrl-C or `--wait-timeout` leaves the job running. `kaggle-llm remote status JOB` shows the summary; `kaggle-llm remote collect JOB` waits and prints the rows; `kaggle-llm remote resume JOB --max-cost USD` resubmits only failed or unrun rows and prints the merged result, keeping the original line numbers. `kaggle-llm remote list` shows local job records (`~/.cache/kaggle-llm/jobs`, private).
 
 ## Operational rules
 

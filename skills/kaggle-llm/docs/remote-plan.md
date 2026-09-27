@@ -429,6 +429,84 @@ Every push adds a permanent private version. Keep experiments minimal.
 
 (Append results here: date, spec summary, job_id, numbers, decision.)
 
+### Phase 1 test changes (2026-09-27)
+- `tests/test_remote.py`: removed the `SkipTest` guard and the `importlib.util`
+  import it used, as Phase 1 step 1 requires. No assertions changed.
+
+### E1: payload limit (2026-09-27)
+- Spec: `dry_run {"sleep_seconds": 0}`, 1000 rows of about 4 KB of random
+  alphanumeric words, `dedup=False`, job `e416195d4956`. Encoded payload
+  3,954,220 bytes; task file 3,962,659 bytes; converted notebook 3,965,600 bytes.
+  Pre-flight: the rendered file passed Kaggle's own `_validate_task_in_file` and
+  `_convert_py_to_notebook`, and the notebook's code cells ran the job locally.
+- Push at 18:54:48Z was refused by the server in 2 s, before creation:
+  `Failed to push task. Error: The kernel source must be less than 1 megabytes in size.`
+  The limit applies to the converted notebook (`ApiCreateBenchmarkTaskRequest.text`).
+- The error states the limit, so I did not halve (2 MB would also fail). No
+  push under the limit was made yet (see the access incident below), so the
+  exact boundary (10^6 vs 2^20 bytes) is unverified; the code assumes 10^6.
+- Decision: `MAX_SOURCE_BYTES = 1_000_000` (converted notebook) and
+  `MAX_PAYLOAD_BYTES = 950_000` (encoded spec; about 12 KB of runner, template
+  and notebook JSON overhead plus margin). `prepare_job` raises a
+  `KaggleLLMError` naming both sizes above it.
+- **This is under the plan's 2 MB threshold: chunking is needed** for large
+  jobs. Estimate: base64 of gzip is about 0.5x of English JSON, so 950 KB holds
+  about 1.9 MB of prompt text, i.e. 1000 prompts averaging about 1.9 KB (a
+  repeated schema instruction compresses to almost nothing). Chunking (several
+  sequential pushes per dataset) or dataset attachment is **not built**; the user
+  decides.
+
+### Incident: benchmark-task API access denied after E1 (2026-09-27 ~18:55Z)
+- Minutes after the refused E1 push, every benchmark-task call from this account
+  returns `403 Permission 'benchmarkTasks.get' was denied`
+  (`kaggle b t status` prints "not found"; `kaggle b t list` prints "No tasks
+  found"). At 18:5xZ, before the push, `status` had shown version 1, Completed,
+  Public False. The same access token (`auth_method ACCESS_TOKEN`) still works
+  for `kaggle kernels list --mine`, so this is a benchmarks-specific permission
+  change, not an expired login.
+- Not worked around (no credential switching). Live steps paused; offline
+  phases continue.
+
+### Phases 1, 3, 4: implementation notes (2026-09-27)
+- All contract classes pass (`PYTHONPATH=src python3 -m unittest discover -s
+  tests -v`: 91 tests, including the 40 existing ones unchanged).
+- Test added: `PrepareJobTests.test_payload_over_kaggle_limit_is_refused`
+  (E1's limit). No existing assertion was changed.
+- Runner: call failures are matched by their `.status` attribute, not by
+  `except CallError`. The rendered task exec's its own copy of the runner, so
+  its `CallError` is a different class from the `remote_runner.CallError` that
+  the tests' injected `FakeCall` raises (`test_kernel_row_failure_reported`
+  caught this). In Kaggle both are the embedded class, so behavior is the same.
+  Exceptions without `.status` in a row become a failed row with the exception's
+  type name, so one bad row cannot lose the others.
+- `SdkBackend.task` calls `get_benchmark_task` directly instead of
+  `_get_benchmark_task(allow_not_found=True)`, because that helper maps 403 to
+  "not found" as well as 404. The incident above is a 403, and `submit` must not
+  treat a denied lookup as "no task, safe to push". Only 404 returns `None`; 403
+  raises `KaggleLLMError` naming the denial.
+- Privacy check: `TaskInfo.is_public` is true if the task **or** its backing
+  notebook (`is_backing_notebook_published`) is public. `None` after a push
+  (visibility unverifiable) is also fatal.
+- `SdkBackend.push` checks the converted notebook against `MAX_SOURCE_BYTES`
+  before sending. `SdkBackend.run(slug, model)` was added for
+  `execute_in: "run"`: `wait` schedules it once the creation for our version
+  completes and no run for the pinned model exists. It is untested live, as
+  the plan allows for the fallback.
+- `wait(sleep=None, clock=None)` resolve `time.sleep`/`time.monotonic` at call
+  time (plan 3.8; the CLI tests patch `time.sleep`).
+- `collect`: flagged rows also get `near_duplicate_of_line`, because many JSONL
+  inputs have no `id`, which would make `near_duplicate_of: null` ambiguous.
+  In lineage merges, the earliest successful row per line wins.
+- `resume` also accepts a `failed` job that never reached Kaggle (all rows),
+  and `summary` adds `error` for failed jobs. `remote status` reads local state
+  only (no Kaggle calls), as `test_detach_status_collect` requires.
+- CLI: the remote summary on stderr adds `merged_rows_ok/failed` when the job
+  has a parent. `DEFAULT_WAIT_TIMEOUT = 3600` lives in `remote.py`.
+- Phase 3's live 3-row smoke test was **not run**: the user approved live pushes
+  for Phase 2 experiments and Phase 5 acceptance only. E5 (a real
+  `submit`/`wait`/`collect` round trip) and acceptance step 1 cover the same
+  path.
+
 ## 7. Acceptance (Phase 5)
 
 1. `kaggle-llm batch prompts50.jsonl --remote --max-cost 2 > out.jsonl`. Use 50
