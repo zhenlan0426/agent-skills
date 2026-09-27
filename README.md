@@ -30,6 +30,20 @@ ln -sfn ~/agent-skills/commands/<name>.md ~/.claude/commands/<name>.md
 `sync.sh` does not manage these yet — a new machine needs the `ln` re-run by
 hand after `install.sh`.
 
+## Explicit-invocation-only skills
+
+The two tools spell "only when the user asks for it" differently, so such a
+skill carries both:
+
+- Claude Code: `disable-model-invocation: true` in the `SKILL.md` frontmatter.
+- Codex: `policy: allow_implicit_invocation: false` in `agents/openai.yaml`.
+
+Codex's `quick_validate.py` rejects the Claude key ("Unexpected key(s) in
+SKILL.md frontmatter"). That is the authoring validator, not the loader: Codex
+0.157 still loads such skills and ignores the key (checked with `codex debug
+prompt-input`), so the failure is expected. The key alone does not keep a skill
+out of Codex's implicit list. Only `openai.yaml` does that.
+
 ## Why the two sides are attached differently
 
 `~/.claude/skills` holds nothing but your skills — Claude Code keeps plugin
