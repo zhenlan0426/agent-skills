@@ -242,6 +242,92 @@ disables it; the existing per-call `--timeout` remains independent. The helper
 never cancels or resubmits automatically. Offline tests cover persistence,
 poll bounds, state transitions, disabling the limit, and recovery diagnostics.
 
+#### Stall reproduced and known-working submitter compared — 18:11 onward
+
+At the user's request, submitted one more fresh copy of the same tiny smoke
+project: `zhenlanwang/kgpu-20260927-181140-915c129481`, pushed at
+18:11:46.260 UTC. Same private T4/script/internet-off/no-sources/300 s request;
+the wrapper is identical to the successful controls apart from the run ID.
+The preceding CLI push was 771.406 s earlier; the UI rerun was about ten minutes
+earlier. This new v1 remained QUEUED at 18:26:39 with an empty failure message.
+GPU used stayed 492.307097 s and GPU/TPU reserved time stayed zero. Source
+retrieved from the server matched the submitted source exactly. Unlike the
+completed controls, this queued kernel's metadata omitted `dockerImage`.
+That may be a consequence of not starting; it does not establish causality.
+At 18:26:54.458 the local helper returned 124 after 900 s observed QUEUED,
+printed the URL and workaround, and did not cancel or resubmit the kernel.
+Artifacts are in `queue-investigation-20260927/repeat-1811/`, including
+`monitor.log`, `comparison.json`, and `final-status.json`.
+
+The user then supplied a better historical control:
+`zhenlanwang/aas-capture-9e47921188` (v1 verified COMPLETE). Its submitter is
+`~/Desktop/Projects/attack/scripts/notebook_true_candidate_capture.py`, which
+calls `kaggle_offline_eval.build_kernel_metadata` and `kaggle_push` from the same
+scripts directory. This is a Python script with embedded base64 source too.
+The actual historical wire request was not available; reconstructing it offline
+through the installed CLI 2.2.2 from that code exposes these differences:
+
+| Setting | Working aas-capture path | kgpu repeat |
+| --- | --- | --- |
+| Docker image | Explicit `gcr.io/kaggle-private-byod/python@sha256:57e612b484cf3df5026ee4dcc3cb176974b22b2bc0937fb1e16132a8be4cb13c` | Omitted |
+| Session timeout | Omitted; plain `kaggle kernels push -p DIR` | `sessionTimeoutSeconds: 300` |
+| Internet | On | Off |
+| Competition | `ai-agent-security-multi-step-tool-attacks` | None |
+| Models | Gemma and GPT-OSS GGUF model sources | None |
+| Machine shape | Metadata `NvidiaTeslaT4` | Flag `NvidiaTeslaT4`, same serialized field |
+| Kernel type | Script | Script |
+
+Neither submitter sets `docker_image_pinning_type`. **Explicit `docker_image`
+is a separate field from that pinning policy**, and the working submitter does
+set it. Its image digest is also different from the default image used by the
+successful kgpu controls. The working driver's `--timeout` option bounds local
+polling, not the remote request; it must not be confused with kgpu's
+`--run-timeout`. It retries nonzero CLI failures, but an accepted QUEUED response
+does not trigger those retries. Internet-on kgpu jobs also stalled earlier.
+
+This strengthens the case for testing actual request differences before
+attributing the issue to a generic scheduler failure. Explicit image selection
+and omission of the API timeout remain **untested causal candidates**, not
+proven fixes. Two fresh, unsubmitted fixtures were prepared for user review:
+`test-explicit-image/` changes only the image field; `test-no-api-timeout/`
+would omit only the timeout argument when submitted. The latter is prepared
+with the usual job timeout but requires an explicit experiment override; it
+would not have a 300 s remote cap. The proposed spacing is 15 minutes. Further
+pushes await the user's plan confirmation under the original test-count rule.
+Offline comparison and plan: `queue-investigation-20260927/aas-comparison/`.
+
+#### Authorized one-field experiments — starting 18:31 UTC
+
+The user authorized both prepared tests, 15 minutes apart. Before submission,
+an offline capture through CLI 2.2.2 verified that the serialized requests
+differ from the failed smoke control only in `dockerImage` or
+`sessionTimeoutSeconds`, respectively, apart from generated identity. Each
+job's `experiment.json` records the effective request without source text.
+
+The explicit-image test `...182614-e2b067ab1e` was pushed at 18:31:53.916 UTC,
+retaining the 300 s API timeout. Its wrapper started at 18:31:59.906 and
+finished at 18:32:07.521, exit 0. Outputs and run marker verified; CUDA result
+13.0 on Tesla T4. Version-specific server metadata confirmed the requested
+`57e612...13c` image. Thus this combination works, but one success is not a
+demonstration that explicit image selection fixes the intermittent stall.
+
+At the post-run check the prior stalled `...181140-915c129481` was already
+CANCEL_ACKNOWLEDGED. The agent did not cancel it. Its cancellation time matters
+for interpretation: it was no longer a simultaneous queued control.
+
+Re-examining `historical-status.json` shows all three original cancelled v1s
+also omit `dockerImage`; their completed UI v2s report `37c64f...d461`. This
+limits the earlier claim of identical metadata: the current version-specific
+records differ in this field, and latest-version comparisons do not establish
+the state of the original stalled version. Missing image may still be an
+effect of failure to start, rather than its cause.
+
+The no-timeout test is scheduled at or after 18:46:53.916 UTC. Its harness
+`submit_no_timeout.py` retains kgpu's one-attempt guard and response checks,
+removing only `--timeout 300` from the emitted CLI command. The source,
+internet flag, accelerator, and default image selection remain unchanged.
+It saves `effective-command.json`, `monitor.log`, and `monitor-result.json`.
+
 These observations do not establish Kaggle's exact script or request limit, or
 guarantee future service acceptance. The helper now limits embedded archives to
 512 KiB and final UTF-8 source to 704 KiB; the latter includes the base64 payload,
