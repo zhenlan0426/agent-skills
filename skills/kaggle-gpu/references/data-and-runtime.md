@@ -2,6 +2,11 @@
 
 ## Inputs larger than the embedded code bundle
 
+The embedded path allows 512 KiB compressed and a 704 KiB final kernel script.
+Base64 expands the archive by roughly one third; do not bypass the source check
+or raise the limits to fit a project. Use the dataset path below when either
+limit is exceeded. This keeps the submitted script small regardless of input size.
+
 Prefer existing Kaggle datasets/competition mounts. Repeat `--dataset owner/slug`,
 `--competition slug`, or `--kernel-source owner/kernel-slug` during preparation.
 Accept competition rules through the website if required; the CLI cannot accept

@@ -4,13 +4,14 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import random
 import runpy
 import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 kg = SimpleNamespace(**runpy.run_path(str(Path(__file__).with_name('kgpu'))))
 G = kg.prepare.__globals__
@@ -33,7 +34,7 @@ class HelperTests(unittest.TestCase):
     def prepare(self, command=None):
         with contextlib.redirect_stdout(io.StringIO()):
             kg.prepare(self.args, command or ['python', 'train.py'])
-        return json.loads((self.job / 'job.json').read_text())
+        return json.loads((Path(self.args.job) / 'job.json').read_text())
 
     def test_git_ignore_credentials_symlinks_and_nested_project(self):
         subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
@@ -66,8 +67,79 @@ class HelperTests(unittest.TestCase):
         script = kg.runner(payload, command, 'test-run', gpu)
         # The only runtime substitution isolates Kaggle's absolute output root.
         script = script.replace("pathlib.Path('/kaggle/working')", f'pathlib.Path({str(working)!r})')
-        run = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True)
+        script_path = self.root / 'kernel.py'
+        script_path.write_text(script)
+        run = subprocess.run([sys.executable, str(script_path)], capture_output=True, text=True)
         return run, working
+
+    def test_large_incompressible_project_round_trip_and_rejection(self):
+        data = random.Random(0).randbytes(kg.COMPRESSED_LIMIT - 1024)
+        (self.project / 'payload.bin').write_bytes(data)
+        job = self.prepare()
+        sizes = job['sizes']
+        self.assertGreater(sizes['compressed_bytes'], kg.COMPRESSED_LIMIT - 1024)
+        self.assertLessEqual(sizes['compressed_bytes'], kg.COMPRESSED_LIMIT)
+        self.assertEqual(sizes['source_bytes'], (self.job / 'kernel.py').stat().st_size)
+        run, working = self.run_generated([sys.executable, 'train.py'])
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual((working / 'project/payload.bin').read_bytes(), data)
+        # A real oversized incompressible archive must fail without preparing a job.
+        (self.project / 'payload.bin').write_bytes(data + random.Random(1).randbytes(2048))
+        self.args.job = str(self.root / 'oversized')
+        with self.assertRaisesRegex(ValueError, 'private dataset'):
+            kg.prepare(self.args, ['python', 'train.py'])
+        self.assertFalse(Path(self.args.job).exists())
+
+    def test_source_limit_counts_utf8_command_before_creating_job(self):
+        # len(str) fits, but UTF-8 bytes do not.
+        with self.assertRaisesRegex(ValueError, 'Kernel source'):
+            kg.prepare(self.args, ['python', 'train.py', '\u754c' * (kg.SOURCE_LIMIT // 2)])
+        self.assertFalse(self.job.exists())
+
+    def test_submit_rechecks_source_before_recording_attempt(self):
+        self.prepare()
+        source = self.job / 'kernel.py'
+        source.write_bytes(b'#' * (kg.SOURCE_LIMIT + 1))
+        fake_cli = Mock(return_value='Kernel version 1 successfully pushed\n')
+        with patch.dict(G, {'cli': fake_cli}), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, 'Kernel source'):
+                kg.submit(self.args)
+            fake_cli.assert_not_called()
+            self.assertFalse((self.job / 'submission-attempt.json').exists())
+            source.write_bytes(b'#' * kg.SOURCE_LIMIT)
+            kg.submit(self.args)
+        self.assertEqual(fake_cli.call_count, 1)
+        attempt = json.loads((self.job / 'submission-attempt.json').read_text())
+        self.assertEqual(attempt['source_bytes'], kg.SOURCE_LIMIT)
+
+    def test_submit_cannot_switch_to_an_unchecked_code_file(self):
+        self.prepare()
+        path = self.job / 'kernel-metadata.json'
+        metadata = json.loads(path.read_text())
+        metadata['code_file'] = 'other.py'
+        kg.save(path, metadata)
+        with self.assertRaisesRegex(ValueError, 'code_file'):
+            kg.submit(self.args)
+        self.assertFalse((self.job / 'submission-attempt.json').exists())
+
+    def test_submission_failure_and_timeout_preserve_diagnostics(self):
+        for index, response in enumerate([
+            subprocess.CompletedProcess([], 1, '', '400 Client Error: Bad Request\n'),
+            subprocess.TimeoutExpired('kaggle', 120, output=b'partial response\n', stderr=b'diagnostic\n'),
+        ]):
+            self.args.job = str(self.root / f'failed-{index}')
+            self.prepare()
+            job_path = Path(self.args.job)
+            options = {'side_effect': response} if isinstance(response, Exception) else {'return_value': response}
+            with patch.object(subprocess, 'run', **options) as call, contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises((ValueError, subprocess.TimeoutExpired)):
+                    kg.submit(self.args)
+                with self.assertRaises(FileExistsError):
+                    kg.submit(self.args)
+            self.assertEqual(call.call_count, 1)
+            self.assertFalse((job_path / 'submitted.json').exists())
+            log = (job_path / 'submission.log').read_text()
+            self.assertIn('400 Client Error' if index == 0 else 'partial response\ndiagnostic', log)
 
     def test_runner_preserves_argv_and_outputs(self):
         tricky = 'spaces ; $HOME `uname` "quotes"'

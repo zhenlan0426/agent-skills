@@ -24,15 +24,29 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
   run `uv tool install google-colab-cli==0.7.4`. If `colab version` reports a
   different version, tell the user: the workarounds below may no longer hold.
 - **Pick the GPU with the user** unless they named one or delegated the choice
-  (for example "whatever fits under N units/hour"). The local 4090 has 24GB:
-  T4 (16GB) and L4 (24GB) are slower than the 4090 and only make sense for
-  parallel work. For more VRAM or speed, choose A100, H100, or G4. `cgpu up`
-  prints the real GPU and memory, and the hourly rate from `colab usage`. Tell
-  the user the rate.
-- If the requested GPU won't allocate (A100/H100 are often unavailable), **ask
-  before switching to another type**, unless the user already said what to fall
-  back to. `cgpu up` already refuses unknown GPU names, because the raw CLI
-  silently turns them into an A100.
+  (for example "whatever fits under N units/hour"). Measured on this account
+  (Colab Pro, 2026-09-27; rates in compute units per hour):
+
+  | `--gpu` | GPU | VRAM | vCPU / RAM | CU/hr |
+  |---|---|---|---|---|
+  | T4 | Tesla T4 | 16GB | 2 / 13GB (high-mem: 8 / 53GB) | 1.07 (1.27) |
+  | L4 | L4 | 24GB | 12 / 56GB | 1.54 |
+  | A100 --high-mem | A100 | not probed (hung) | High-RAM | 6.77 |
+  | G4 | RTX PRO 6000 Blackwell | 96GB | 48 / 185GB | 8.90 |
+  | H100 | — | — | rejected: no entitlement on Pro | — |
+
+  The local 4090 has 24GB. T4 and L4 are slower than the 4090 and only make
+  sense for parallel work. For more VRAM or speed, choose G4 or A100. `cgpu up`
+  prints the actual GPU and the current rate. Tell the user the rate.
+- Plain `--gpu A100` returned 503 while `A100 --high-mem` allocated. The first
+  exec on that A100 then hung without starting. If `up` fails or hangs, run
+  `cgpu down` and **ask before switching to another type**, unless the user
+  already said what to fall back to. `cgpu up` already refuses unknown GPU
+  names, because the raw CLI silently turns them into an A100.
+- Billing looks like it has a minimum per allocation. Four sub-minute probes
+  plus one ~7-minute A100 cost 4.87 CU, which matches ~15 minutes billed for
+  each. Don't allocate VMs just to test availability, and reuse one session
+  instead of repeatedly running `up`/`down`.
 - `cgpu up` refuses a session name that is already live: the raw CLI would
   allocate a second VM under it and orphan the first, still billed. To replace
   a session, `cgpu down` it first.

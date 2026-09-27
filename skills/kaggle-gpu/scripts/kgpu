@@ -17,7 +17,9 @@ import zipfile
 EXCLUDED = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.pytest_cache',
             '.mypy_cache', '.ipynb_checkpoints', '.kaggle', '.ssh', '.aws', '.cache',
             '.env', '.envrc', '.netrc', 'kaggle.json', 'access_token', 'credentials.json'}
-COMPRESSED_LIMIT = 2 * 1024 * 1024
+# Live transport validation and failure evidence: references/cli-notes.md.
+COMPRESSED_LIMIT = 512 * 1024
+SOURCE_LIMIT = 704 * 1024
 UNPACKED_LIMIT = 20 * 1024 * 1024
 
 
@@ -25,10 +27,20 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + '\n')
 
 
-def cli(*args, timeout=120):
-    result = subprocess.run(['kaggle', *map(str, args)], capture_output=True,
-                            text=True, timeout=timeout)
+def cli(*args, timeout=120, log_path=None):
+    try:
+        result = subprocess.run(['kaggle', *map(str, args)], capture_output=True,
+                                text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        if log_path is not None:
+            # TimeoutExpired may carry bytes even with text=True.
+            chunks = [v.decode('utf-8', errors='replace') if isinstance(v, bytes) else v or ''
+                      for v in (exc.stdout, exc.stderr)]
+            log_path.write_text(''.join(chunks) + '\nLocal CLI timeout; remote acceptance is unknown.\n')
+        raise
     output = result.stdout + result.stderr
+    if log_path is not None:
+        log_path.write_text(output)
     if result.returncode:
         raise ValueError(f'Kaggle exited {result.returncode}:\n{output}')
     return output
@@ -82,8 +94,20 @@ def bundle(project, excludes):
         raise ValueError('No project files remain after exclusions.')
     data = output.getvalue()
     if len(data) > COMPRESSED_LIMIT:
-        raise ValueError('Compressed project exceeds 2 MiB. Use an attached dataset for large assets.')
+        raise ValueError(f'Compressed project is {len(data):,} bytes; embedded limit is '
+                         f'{COMPRESSED_LIMIT:,} bytes. Exclude large files or use a private '
+                         'dataset with a small bootstrap (references/data-and-runtime.md).')
     return base64.b64encode(data).decode(), manifest
+
+
+def check_source_size(source):
+    size = len(source)
+    if size > SOURCE_LIMIT:
+        raise ValueError(f'Kernel source is {size:,} bytes; tested embedded limit is '
+                         f'{SOURCE_LIMIT:,} bytes including base64, wrapper, and command. '
+                         'Reduce the embedded project/command or use a private dataset '
+                         '(references/data-and-runtime.md). No submission attempted.')
+    return size
 
 
 def runner(payload, command, run_id, gpu):
@@ -143,13 +167,19 @@ def prepare(args, command):
                     enable_gpu=gpu, enable_internet=args.internet,
                     dataset_sources=args.dataset, competition_sources=args.competition,
                     kernel_sources=args.kernel_source, model_sources=[])
+    source = runner(payload, command, run_id, gpu).encode('utf-8')
+    source_bytes = check_source_size(source)
+    sizes = dict(compressed_bytes=len(base64.b64decode(payload)), base64_bytes=len(payload),
+                 unpacked_bytes=sum(f['bytes'] for f in manifest), source_bytes=source_bytes)
     target.mkdir(parents=True)
-    (target / 'kernel.py').write_text(runner(payload, command, run_id, gpu))
+    (target / 'kernel.py').write_bytes(source)
     save(target / 'kernel-metadata.json', metadata)
     save(target / 'manifest.json', manifest)
     save(target / 'job.json', dict(ref=ref, run_id=run_id, accelerator=args.accelerator,
-                                  run_timeout=args.run_timeout, command=command))
-    print(f'Prepared {ref}\nReview {target / "manifest.json"}\nNo files uploaded.')
+                                  run_timeout=args.run_timeout, command=command, sizes=sizes))
+    print(f'Prepared {ref}\nCompressed project: {sizes["compressed_bytes"]:,} / '
+          f'{COMPRESSED_LIMIT:,} bytes; kernel source: {source_bytes:,} / {SOURCE_LIMIT:,} bytes.'
+          f'\nReview {target / "manifest.json"}\nNo files uploaded.')
 
 
 def submit(args):
@@ -158,17 +188,20 @@ def submit(args):
     if (metadata.get('is_private') is not True or metadata.get('id') != job['ref']
             or metadata.get('id_no')):
         raise ValueError('Job metadata must retain its unique id and is_private=true.')
+    if metadata.get('code_file') != 'kernel.py':
+        raise ValueError('Job metadata must retain code_file=kernel.py.')
+    # Recheck the actual file: old jobs and edits must not bypass the new ceiling.
+    source_bytes = check_source_size((path / 'kernel.py').read_bytes())
     attempt = path / 'submission-attempt.json'
     # Exclusive create also prevents duplicate concurrent submissions.
     with attempt.open('x') as stream:
-        json.dump({'ref': job['ref'], 'attempted_at': time.time()}, stream)
+        json.dump({'ref': job['ref'], 'attempted_at': time.time(), 'source_bytes': source_bytes}, stream)
     print('Kernel URL: https://www.kaggle.com/code/' + job['ref'], flush=True)
     print('Submission recorded. If interrupted, check status before any retry.', flush=True)
     cmd = ['kernels', 'push', '-p', str(path), '--timeout', str(job['run_timeout'])]
     if job['accelerator'] != 'cpu':
         cmd += ['--accelerator', job['accelerator']]
-    output = cli(*cmd)
-    (path / 'submission.log').write_text(output)
+    output = cli(*cmd, log_path=path / 'submission.log')
     print(output, end='')
     # CLI 2.2.2 omits the number when the response lacks one.
     match = re.search(r'Kernel version (?:(\d+) )?successfully pushed', output)

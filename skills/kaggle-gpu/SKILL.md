@@ -58,9 +58,15 @@ kgpu pull ./kaggle-job ./results
 ignore rules in Git repositories, excludes common caches/credentials, and skips
 symlinks. The manifest is the authoritative upload list: exclusions are not a
 secret scanner. Repeat `--exclude 'pattern'` for project-specific omissions.
-Prepare outside the project directory. The helper caps the bundle at 2 MiB
-compressed and 20 MiB unpacked (local guardrails, not Kaggle service limits).
-Use attached datasets for larger assets. A project may contain notebooks, but
+Prepare outside the project directory. The helper caps the bundle at **512 KiB
+compressed**, **20 MiB unpacked**, and the final UTF-8 kernel script at **704 KiB**
+(base64, wrapper, and command included). Preparation reports archive/script sizes
+and records them in `job.json`; submission rechecks the actual script, including
+older prepared jobs. These are local guardrails backed by the
+[live validation record](references/cli-notes.md), not Kaggle's published limits:
+a near-2 MiB bundle in a 2,800,000-byte script was rejected by the API.
+Use a private dataset and small bootstrap for larger projects, as described in
+[data and runtime](references/data-and-runtime.md). A project may contain notebooks, but
 the command must be an executable batch entrypoint; a notebook is not executed
 just because it is bundled.
 
@@ -78,6 +84,7 @@ probe fails a GPU job instead of silently continuing on CPU.
 - `submit` records the attempt before contacting Kaggle and refuses a second
   attempt from that directory. A CLI timeout or ambiguous response may still
   mean the job started. Check its saved URL/status; don't blindly retry.
+  `submission.log` preserves CLI errors and partial output from local timeouts.
   Submission success only means accepted, not that the job succeeded.
 - `wait` returns 0 for COMPLETE, 1 for failure/cancellation, 124 when the local
   wait expires, and 2 for an API/parse problem. Local timeouts leave remote work
