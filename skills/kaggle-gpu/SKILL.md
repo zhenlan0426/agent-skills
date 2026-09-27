@@ -30,8 +30,9 @@ shell, incremental file push, or Colab-style `up`/`down` in this workflow.
   the documented default GPU shape (T4 ×2); it is not a combined 32 GB GPU and
   code must explicitly use multiple devices. Other accelerator names and quotas
   depend on account/competition eligibility. Don't promise an A100/H100 or hardcode
-  weekly allowances. Check the account UI for remaining quota. If allocation
-  fails, report it before switching hardware or resubmitting.
+  weekly allowances. Check the account UI for remaining quota (`kaggle quota`
+  crashes in CLI 2.2.2). If allocation fails, report it before switching
+  hardware or resubmitting.
 - Kernel code and outputs are private by default. Review the local file manifest
   before upload. Secrets belong in Kaggle Secrets, not source, argv, or datasets.
   Read [references/data-and-runtime.md](references/data-and-runtime.md) when
