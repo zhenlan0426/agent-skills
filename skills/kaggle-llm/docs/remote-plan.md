@@ -466,6 +466,9 @@ Every push adds a permanent private version. Keep experiments minimal.
   change, not an expired login.
 - Not worked around (no credential switching). Live steps paused; offline
   phases continue.
+- Read-only re-checks at 19:00Z, 19:01Z, 19:02Z, then every 2 min until
+  19:33Z: still 403. E2, E3, E4, E5 and Phase 5 are blocked until access is
+  restored.
 
 ### Phases 1, 3, 4: implementation notes (2026-09-27)
 - All contract classes pass (`PYTHONPATH=src python3 -m unittest discover -s
