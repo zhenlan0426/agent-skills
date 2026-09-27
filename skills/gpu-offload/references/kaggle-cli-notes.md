@@ -285,16 +285,12 @@ polling, not the remote request; it must not be confused with kgpu's
 `--run-timeout`. It retries nonzero CLI failures, but an accepted QUEUED response
 does not trigger those retries. Internet-on kgpu jobs also stalled earlier.
 
-This strengthens the case for testing actual request differences before
-attributing the issue to a generic scheduler failure. Explicit image selection
-and omission of the API timeout remain **untested causal candidates**, not
-proven fixes. Two fresh, unsubmitted fixtures were prepared for user review:
-`test-explicit-image/` changes only the image field; `test-no-api-timeout/`
-would omit only the timeout argument when submitted. The latter is prepared
-with the usual job timeout but requires an explicit experiment override; it
-would not have a 300 s remote cap. The proposed spacing is 15 minutes. Further
-pushes await the user's plan confirmation under the original test-count rule.
-Offline comparison and plan: `queue-investigation-20260927/aas-comparison/`.
+The working submitter's code calls the same `kaggle kernels push` CLI command;
+its retry wrapper only retries nonzero CLI failures and cannot affect a push
+that Kaggle accepted. Its command omits `--accelerator`, but setting
+`machine_shape` in metadata serializes to the same `machineShape` field.
+The historical CLI version used by that run was not recorded. Offline request
+reconstruction and test plan: `queue-investigation-20260927/aas-comparison/`.
 
 #### Authorized one-field experiments — starting 18:31 UTC
 
@@ -323,11 +319,41 @@ records differ in this field, and latest-version comparisons do not establish
 the state of the original stalled version. Missing image may still be an
 effect of failure to start, rather than its cause.
 
-The no-timeout test is scheduled at or after 18:46:53.916 UTC. Its harness
-`submit_no_timeout.py` retains kgpu's one-attempt guard and response checks,
+The no-timeout test was scheduled for 18:46:53.916 UTC. Its harness
+`submit_no_timeout.py` retained kgpu's one-attempt guard and response checks,
 removing only `--timeout 300` from the emitted CLI command. The source,
-internet flag, accelerator, and default image selection remain unchanged.
-It saves `effective-command.json`, `monitor.log`, and `monitor-result.json`.
+internet flag, accelerator, and default image selection remained unchanged.
+It saved `effective-command.json`, `monitor.log`, and `monitor-result.json`.
+
+#### Matched image/no-timeout pair — 18:46–19:04 UTC
+
+The default-image no-timeout control,
+`...182614-5622f96b15`, was accepted at 18:46:56.393 UTC. It remained QUEUED
+for 711.778 seconds before the wrapper started at 18:58:48.171, then completed
+with exit 0. `kgpu pull` verified the run marker and `out/smoke.json` (13.0 on
+Tesla T4). Version-specific server status was COMPLETE with an empty failure
+message; the server resolved the omitted image to
+`gcr.io/kaggle-images/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461`.
+
+The matched treatment, `...185919-0e50e519e0`, was submitted at 19:02:01.729
+UTC, more than 15 minutes later. Like the control it omitted the remote API
+timeout. Offline capture through CLI 2.2.2 verified that the only request-field
+difference was `dockerImage`, set to the image from the working AAS job:
+`gcr.io/kaggle-private-byod/python@sha256:57e612b484cf3df5026ee4dcc3cb176974b22b2bc0937fb1e16132a8be4cb13c`.
+Its wrapper started after 4.085 seconds and completed with exit 0. The marker
+and smoke output were verified (13.0 on Tesla T4); version-specific server
+status was COMPLETE with an empty failure message and confirmed the requested
+image. Both the request comparison and server records omit source text.
+
+This matched pair strongly supports explicit image selection as a mitigation
+for the reproduced long QUEUED delay. It also shows that omitting the API
+runtime timeout does not prevent a long queue. Earlier default-image CLI
+controls sometimes started promptly, so the image is not proven to explain
+every intermittent stall or guarantee that Kaggle will never queue a job.
+For the tested `NvidiaTeslaT4` target, `kgpu prepare` now selects the AAS image
+by default; `--docker-image` overrides it and `--use-kaggle-default-image`
+leaves it unset. The 15-minute `kgpu wait` queue limit remains the recovery
+path for delays that still occur.
 
 These observations do not establish Kaggle's exact script or request limit, or
 guarantee future service acceptance. The helper now limits embedded archives to

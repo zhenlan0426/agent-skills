@@ -62,6 +62,17 @@ Use a private dataset and small bootstrap for larger projects, as described in
 the command must be an executable batch entrypoint; a notebook is not executed
 just because it is bundled.
 
+For `NvidiaTeslaT4`, `prepare` now selects the explicit image used by the
+working `aas-capture` submitter:
+`gcr.io/kaggle-private-byod/python@sha256:57e612b484cf3df5026ee4dcc3cb176974b22b2bc0937fb1e16132a8be4cb13c`.
+A matched 2026-09-27 smoke pair reached the wrapper in 4.1 seconds with this
+image and 711.8 seconds with Kaggle's default image, with no API runtime timeout
+in either request. The paired result supports the pin as a startup-delay
+mitigation; it does not guarantee Kaggle will never queue a kernel. Pass
+`--docker-image DIGEST` to select another Kaggle-provided image, or
+`--use-kaggle-default-image` to leave the image unset. Other accelerator shapes
+continue to use Kaggle's default image unless one is specified.
+
 `--setup 'ARGS'` runs `envsetup install ARGS` in the kernel before the command
 (fingerprint saved as `out/env.json`, install report as `out/envsetup.json`); a
 failed install fails the job without running the command. It needs `--internet`

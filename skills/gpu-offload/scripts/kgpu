@@ -22,6 +22,11 @@ EXCLUDED = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.pytest_cac
 COMPRESSED_LIMIT = 512 * 1024
 SOURCE_LIMIT = 704 * 1024
 UNPACKED_LIMIT = 20 * 1024 * 1024
+# The image used by the working aas-capture submitter and matched T4 probes.
+DEFAULT_T4_DOCKER_IMAGE = (
+    'gcr.io/kaggle-private-byod/python@sha256:'
+    '57e612b484cf3df5026ee4dcc3cb176974b22b2bc0937fb1e16132a8be4cb13c'
+)
 ENVSETUP = Path(__file__).resolve().parent / 'envsetup'
 
 
@@ -185,11 +190,19 @@ def prepare(args, command):
     ref = args.owner + '/' + slug
     # TPU shapes are accelerators too, but have no nvidia-smi to probe.
     gpu = args.accelerator.startswith('Nvidia')
+    use_kaggle_default_image = getattr(args, 'use_kaggle_default_image', False)
+    docker_image = getattr(args, 'docker_image', None)
+    if docker_image is not None and not docker_image.strip():
+        raise ValueError('--docker-image must not be empty.')
+    if docker_image is None and not use_kaggle_default_image and args.accelerator == 'NvidiaTeslaT4':
+        docker_image = DEFAULT_T4_DOCKER_IMAGE
     metadata = dict(id=ref, title=slug, code_file='kernel.py', language='python',
                     kernel_type='script', is_private=True,
                     enable_gpu=gpu, enable_internet=args.internet,
                     dataset_sources=args.dataset, competition_sources=args.competition,
                     kernel_sources=args.kernel_source, model_sources=[])
+    if docker_image is not None:
+        metadata['docker_image'] = docker_image
     source = runner(payload, command, run_id, gpu, setup).encode('utf-8')
     source_bytes = check_source_size(source)
     sizes = dict(compressed_bytes=len(base64.b64decode(payload)), base64_bytes=len(payload),
@@ -200,7 +213,7 @@ def prepare(args, command):
     save(target / 'manifest.json', manifest)
     save(target / 'job.json', dict(ref=ref, run_id=run_id, accelerator=args.accelerator,
                                   run_timeout=args.run_timeout, command=command, sizes=sizes,
-                                  setup=setup and setup[1]))
+                                  setup=setup and setup[1], docker_image=docker_image))
     print(f'Prepared {ref}\nCompressed project: {sizes["compressed_bytes"]:,} / '
           f'{COMPRESSED_LIMIT:,} bytes; kernel source: {source_bytes:,} / {SOURCE_LIMIT:,} bytes.'
           f'\nReview {target / "manifest.json"}\nNo files uploaded.')
@@ -356,6 +369,10 @@ def main():
     prep.add_argument('--accelerator', required=True, help='exact Kaggle shape, e.g. NvidiaTeslaT4, or cpu')
     prep.add_argument('--run-timeout', type=positive, default=3600, help='remote runtime limit in seconds (default 3600)')
     prep.add_argument('--internet', action='store_true', help='enable network in the kernel')
+    image = prep.add_mutually_exclusive_group()
+    image.add_argument('--docker-image', help='Kaggle-provided image digest; T4 defaults to a tested pinned image')
+    image.add_argument('--use-kaggle-default-image', action='store_true',
+                       help='leave docker_image unset instead of using the tested T4 default')
     prep.add_argument('--setup', metavar="'ARGS'",
                       help="run `envsetup install ARGS` before the command, e.g. "
                            "--setup '-r requirements.txt --skip flash-attn'")
