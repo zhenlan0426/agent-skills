@@ -23,7 +23,7 @@ Usage:
   cgpu logs SESSION [-n N] [--full]       tail the current job's log
   cgpu wait SESSION [--poll S] [--timeout S]  block until the job ends; exits with
                                           its code, or 124 if --timeout runs out
-  cgpu kill SESSION                       SIGTERM the job's process group
+  cgpu kill SESSION                       stop the job (SIGTERM, then SIGKILL if needed)
   cgpu pull SESSION REMOTE LOCAL          file: to LOCAL, or into it if LOCAL is a dir
                                           or ends in /; dir: its contents into LOCAL
   cgpu sh SESSION -- CMD                  run a short command (kernel must be idle)
@@ -55,8 +55,10 @@ GPUS = {"T4", "L4", "G4", "A100", "H100"}
 STATE_DIR = Path.home() / ".cache" / "cgpu"
 REMOTE_ROOT = "/content/.cgpu"
 ENVSETUP = Path(__file__).resolve().parent / "envsetup"
-TAR_EXCLUDES = {".git", "__pycache__", ".venv", "venv", "node_modules", "wandb",
-                ".ipynb_checkpoints", ".mypy_cache", ".pytest_cache"}
+PUSH_EXCLUDED = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.pytest_cache',
+                 '.mypy_cache', '.ipynb_checkpoints', '.kaggle', '.ssh', '.aws', '.cache',
+                 '.env', '.envrc', '.netrc', 'kaggle.json', 'access_token', 'credentials.json'}
+PUSH_EXCLUDED_SUFFIXES = {'.pem', '.key', '.p12', '.pfx', '.pyc'}
 # `colab exec --timeout` is a wall-clock budget; anything short kills the
 # client (not the job) with a TimeoutError traceback and exit 1.
 LONG = str(7 * 24 * 3600)
@@ -68,6 +70,8 @@ TAIL_BYTES = 256 * 1024
 # means the cell is gone without writing status.json: kernel restarted or died.
 BEAT_STALE = 180
 START_WAIT = int(os.environ.get("CGPU_START_WAIT", 180))
+TERM_GRACE = float(os.environ.get("CGPU_TERM_GRACE", 5))
+KILL_WAIT = float(os.environ.get("CGPU_KILL_WAIT", 5))
 
 
 def die(msg, code=1):
@@ -183,14 +187,13 @@ def current_job(session):
 
 
 def session_lock(session):
-    """Hold for the rest of the process: up, start and down on one session
-    must not interleave (each reads or replaces the job record)."""
+    """Keep local up, start, push and down operations on one session ordered."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock = open(STATE_DIR / f"{session}.lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        die(f"another `cgpu up/start/down` on '{session}' is in progress")
+        die(f"another `cgpu up/start/push/down` on '{session}' is in progress")
     return lock
 
 
@@ -261,6 +264,46 @@ def require_idle(session, what):
             "session, or pull single files, which work mid-job")
 
 
+def excluded_push_path(rel):
+    return any(part in PUSH_EXCLUDED or part.startswith('.env.')
+               or Path(part).suffix.lower() in PUSH_EXCLUDED_SUFFIXES for part in rel.parts)
+
+
+def project_files(src):
+    """Files in a push archive, respecting Git ignore rules and secret filters."""
+    git = subprocess.run(['git', '-C', str(src), 'rev-parse', '--show-toplevel'],
+                         capture_output=True, text=True)
+    if git.returncode == 0:
+        listing = subprocess.run(['git', '-C', str(src), 'ls-files', '-z', '--cached',
+                                  '--others', '--exclude-standard', '--', '.'],
+                                 capture_output=True, check=True)
+        names = sorted(set(os.fsdecode(listing.stdout).rstrip('\0').split('\0')))
+    else:
+        names = []
+        for root, dirs, files in os.walk(src, followlinks=False):
+            relroot = Path(root).relative_to(src)
+            dirs[:] = [name for name in dirs
+                       if not excluded_push_path(relroot / name)
+                       and not (Path(root) / name).is_symlink()]
+            names.extend((relroot / name).as_posix() for name in files)
+        names.sort()
+
+    files = []
+    for name in names:
+        if not name:
+            continue
+        rel = Path(name)
+        if rel.is_absolute() or '..' in rel.parts or excluded_push_path(rel):
+            continue
+        path = src / rel
+        if any((src / Path(*rel.parts[:n])).is_symlink()
+               for n in range(1, len(rel.parts) + 1)):
+            continue
+        if path.is_file():
+            files.append((path, rel))
+    return files
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_up(a):
@@ -299,19 +342,31 @@ def cmd_push(a):
     if not src.exists():
         die(f"{src} does not exist")
     dest = a.remote or f"/content/{src.name}"
+    lock = session_lock(a.session)  # noqa: F841 (avoid racing local start/up/down)
     if src.is_file():
+        if src.stat().st_size > CHUNK:
+            require_idle(a.session, f"pushing large file {src}")
         upload(a.session, src, dest)
         return
+    if not src.is_dir():
+        die(f"{src} is not a regular file or directory")
+    members = project_files(src)
+    if not members:
+        die("no project files remain after Git-ignore and credential exclusions")
     with tempfile.TemporaryDirectory() as d:
         tgz = Path(d) / "push.tgz"
         with tarfile.open(tgz, "w:gz") as t:
-            t.add(src, arcname=".", filter=lambda ti: None if Path(ti.name).name
-                  in TAR_EXCLUDES or ti.name.endswith(".pyc") else ti)
+            for path, rel in members:
+                t.add(path, arcname=rel.as_posix(), recursive=False)
         remote_tgz = f"/tmp/cgpu-push-{uuid.uuid4().hex[:8]}.tgz"
-        upload(a.session, tgz, remote_tgz)
-    exec_py(a.session, f"import os,tarfile\nos.makedirs({dest!r},exist_ok=True)\n"
-            f"tarfile.open({remote_tgz!r}).extractall({dest!r},filter='fully_trusted')\n"
-            f"os.remove({remote_tgz!r})\nprint('extracted to', {dest!r})")
+        require_idle(a.session, f"pushing directory {src}")
+        try:
+            upload(a.session, tgz, remote_tgz)
+            exec_py(a.session, f"import os,tarfile\nos.makedirs({dest!r},exist_ok=True)\n"
+                    f"tarfile.open({remote_tgz!r}).extractall({dest!r},filter='fully_trusted')\n"
+                    f"print('extracted to', {dest!r})")
+        finally:
+            colab("rm", "-s", a.session, remote_tgz, capture=True, check=False)
 
 
 def upload(session, local, remote):
@@ -323,17 +378,21 @@ def upload(session, local, remote):
         colab("upload", "-s", session, str(local), remote, capture=True)
         return
     parts = []
-    with open(local, "rb") as f, tempfile.TemporaryDirectory() as d:
-        while chunk := f.read(CHUNK):
-            part = Path(d) / "part"
-            part.write_bytes(chunk)
-            rpart = f"/tmp/cgpu-part-{uuid.uuid4().hex[:8]}"
-            colab("upload", "-s", session, str(part), rpart, capture=True)
-            parts.append(rpart)
-            print(f"[cgpu]   {f.tell() / 1e6:.0f}/{size / 1e6:.0f} MB")
-    exec_py(session, f"import os\nos.makedirs(os.path.dirname({remote!r}) or '.',"
-            f"exist_ok=True)\nwith open({remote!r},'wb') as out:\n"
-            f"    for p in {parts!r}:\n        out.write(open(p,'rb').read()); os.remove(p)")
+    try:
+        with open(local, "rb") as f, tempfile.TemporaryDirectory() as d:
+            while chunk := f.read(CHUNK):
+                part = Path(d) / "part"
+                part.write_bytes(chunk)
+                rpart = f"/tmp/cgpu-part-{uuid.uuid4().hex[:8]}"
+                parts.append(rpart)
+                colab("upload", "-s", session, str(part), rpart, capture=True)
+                print(f"[cgpu]   {f.tell() / 1e6:.0f}/{size / 1e6:.0f} MB")
+        exec_py(session, f"import os\nos.makedirs(os.path.dirname({remote!r}) or '.',"
+                f"exist_ok=True)\nwith open({remote!r},'wb') as out:\n"
+                f"    for p in {parts!r}:\n        out.write(open(p,'rb').read())")
+    finally:
+        for part in parts:
+            colab("rm", "-s", session, part, capture=True, check=False)
 
 
 def cmd_secrets(a):
@@ -368,11 +427,13 @@ def cmd_setup(a):
         steps.append(["install", *a.cmd, "--report", f"{REMOTE_ROOT}/envsetup.json"])
     # Stream line by line: a child's raw stdout bypasses the kernel's iopub
     # stream, and an install can run for minutes.
-    code = "import subprocess, sys\n" + "".join(
-        f"p = subprocess.Popen([sys.executable, {remote!r}, *{step!r}], "
-        "stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\n"
-        "for line in p.stdout:\n    print(line, end='')\n"
-        "_cgpu_rc = _cgpu_rc or p.wait()\n" for step in steps)
+    code = ("import subprocess, sys\n"
+            f"for step in {steps!r}:\n"
+            f"    p = subprocess.Popen([sys.executable, {remote!r}, *step], "
+            "stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\n"
+            "    for line in p.stdout:\n        print(line, end='')\n"
+            "    _cgpu_step_rc = p.wait()\n"
+            "    if _cgpu_step_rc:\n        _cgpu_rc = _cgpu_step_rc\n        break\n")
     rc = exec_py(a.session, code, timeout=str(a.timeout), check=False)
     if rc:
         die(f"setup failed (exit {rc}); its reason is in the output above", rc)
@@ -541,17 +602,79 @@ def cmd_wait(a):
     sys.exit(128 - rc if rc < 0 else rc)  # killed by signal N -> 128+N
 
 
+def signal_group(session, pid, sig):
+    marker = f"__CGPU_{sig}_{uuid.uuid4().hex}__"
+    failed = f"__CGPU_{sig}_MISSING__"
+    command = f"if kill -{sig} -{pid}; then echo {marker}; else echo {failed}; fi\n"
+    r = colab("console", "-s", session, stdin=command, capture=True,
+              check=False, timeout=60)
+    output = r.stdout + r.stderr
+    return marker in output, output
+
+
+def wait_for_status(session, job, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        status = job_status(session, job)
+        if status is not None:
+            return status
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.25, remaining))
+
+
 def cmd_kill(a):
     job = current_job(a.session)
+    kind, status = job_state(a.session, job)
+    if kind == "finished":
+        print(f"[cgpu] job {job['id']} already finished (exit={status['rc']})")
+        return
+    if kind == "cancelled":
+        print(f"[cgpu] job {job['id']} was cancelled before it started")
+        return
     pid = download_text(a.session, job["dir"] + "/pid")
     if pid is None:
+        status = wait_for_status(a.session, job, 1)
+        if status is not None:
+            print(f"[cgpu] job {job['id']} already finished (exit={status['rc']})")
+            return
         die("job has no pid file yet")
-    # The kernel is busy running the job cell, so go through the terminal.
-    colab("console", "-s", a.session, stdin=f"kill -TERM -{pid.strip()}\n",
-          capture=True, timeout=60)
+    pid = pid.strip()
+    if not pid.isdigit():
+        die(f"job pid file contains an invalid process id: {pid!r}")
+
+    sent, output = signal_group(a.session, pid, "TERM")
+    if not sent:
+        status = wait_for_status(a.session, job, 1)
+        if status is not None:
+            print(f"[cgpu] job {job['id']} finished before SIGTERM (exit={status['rc']})")
+            return
+        die(f"could not send SIGTERM to process group {pid}: {output.strip() or 'no confirmation'}")
+
+    status = wait_for_status(a.session, job, TERM_GRACE)
+    if status is not None:
+        job["killed"] = True
+        save_job(a.session, job)
+        print(f"[cgpu] job {job['id']} stopped after SIGTERM (exit={status['rc']})")
+        return
+
+    sent, output = signal_group(a.session, pid, "KILL")
+    if not sent:
+        status = wait_for_status(a.session, job, 1)
+        if status is not None:
+            job["killed"] = True
+            save_job(a.session, job)
+            print(f"[cgpu] job {job['id']} finished before SIGKILL (exit={status['rc']})")
+            return
+        die(f"could not send SIGKILL to process group {pid}: {output.strip() or 'no confirmation'}")
+
+    status = wait_for_status(a.session, job, KILL_WAIT)
     job["killed"] = True  # lets `start` proceed past a lost job
     save_job(a.session, job)
-    print(f"[cgpu] sent SIGTERM to process group {pid.strip()}")
+    if status is None:
+        die(f"SIGKILL sent to process group {pid}, but no final status appeared; inspect `cgpu logs {a.session}`", 3)
+    print(f"[cgpu] job {job['id']} required SIGKILL (exit={status['rc']})")
 
 
 def cmd_pull(a):

@@ -2,8 +2,8 @@
 """A stand-in for colab-cli 0.7.4, faithful where cgpu depends on it.
 
 State lives in $FAKE_COLAB. Each VM is a directory whose `fs/` is the VM's `/`
-(cell code has its '/content', '/root' and '/tmp/cgpu-*' paths rewritten
-into it).
+(cgpu's known '/content', secret-destination and '/tmp/cgpu-*' paths are
+rewritten into it).
 The kernel is FIFO: `exec` hands its cell to a detached worker that waits on
 the VM's kernel lock, so a queued cell still runs after its client is killed,
 as on the real service. Messages copy 0.7.4's wording, which cgpu matches on.
@@ -41,9 +41,16 @@ def remote(vm, path):
 
 
 def rewrite(vm, code):
-    # Only paths cgpu itself uses under /tmp, so a test's own temp dir survives.
-    for prefix in ("content", "root", "tmp/cgpu-"):
-        code = code.replace(f"'/{prefix}", f"'{vm / 'fs'}/{prefix}")
+    # Rewrite cgpu's known remote roots only. A command may intentionally use
+    # a Python interpreter under /root, which belongs to the test host.
+    roots = (("/content/", vm / "fs/content/"),
+             ("/root/.kaggle/", vm / "fs/root/.kaggle/"),
+             ("/root/.cache/huggingface/", vm / "fs/root/.cache/huggingface/"),
+             ("/tmp/cgpu-", vm / "fs/tmp/cgpu-"))
+    for old, new in roots:
+        for quote in ("'", '"'):
+            target = str(new).rstrip("/") + ("/" if old.endswith("/") else "")
+            code = code.replace(quote + old, quote + target)
     return code
 
 
@@ -102,7 +109,11 @@ def main():
         if not target.parent.is_dir():
             print(f"[colab] Upload failed: 404 no such directory: {dst}")
             sys.exit(1)
-        shutil.copyfile(src, target)
+        envsetup = os.environ.get("FAKE_COLAB_ENVSETUP")
+        if dst == "/tmp/cgpu-envsetup" and envsetup:
+            shutil.copyfile(envsetup, target)
+        else:
+            shutil.copyfile(src, target)
         print(f"[colab] Uploaded '{src}' to '{dst}'")
     elif cmd == "download":
         vm = vm_dir(s)

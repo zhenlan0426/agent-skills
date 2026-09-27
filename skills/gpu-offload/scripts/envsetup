@@ -113,8 +113,12 @@ def gpus():
     cards = []
     for line in r.stdout.strip().splitlines():
         name, mem, driver, cap = [x.strip() for x in line.split(',')]
-        cards.append({'name': name, 'memory_mib': int(float(mem)), 'driver': driver,
-                      'compute_cap': cap})
+        try:
+            memory = int(float(mem))
+        except ValueError:  # MIG and some virtual devices report [N/A].
+            memory = None
+        cards.append({'name': name, 'memory_mib': memory, 'driver': driver,
+                      'compute_cap': None if cap.strip('[]').upper() == 'N/A' else cap})
     return cards
 
 
@@ -149,6 +153,11 @@ def online():
         except Exception:  # offline, DNS blocked, proxy refusal: all the same here
             continue
     return False
+
+
+def redact_url_credentials(value):
+    """Remove URL user-info while retaining the index host/path for debugging."""
+    return re.sub(r'(?i)(https?://)[^/@\s]+@', r'\1<redacted>@', value)
 
 
 def uv_path():
@@ -190,7 +199,7 @@ def probe(python=sys.executable):
         'user_site': usersite if usersite and Path(usersite).is_dir() else None,
         'pip': pip.stdout.split()[1] if pip.returncode == 0 else None,
         'uv': run([uv, '--version']).stdout.strip() if uv else None,
-        'pip_index': {k: v for k, v in os.environ.items()
+        'pip_index': {k: redact_url_credentials(v) for k, v in os.environ.items()
                       if k.startswith(('PIP_', 'UV_')) and 'TOKEN' not in k and 'PASSWORD' not in k},
         'gpus': gpus(),
         'driver_cuda': driver_cuda(),
@@ -210,13 +219,20 @@ def probe(python=sys.executable):
 
 def summary(p):
     t = p['torch'] or {}
-    gpu = ', '.join(f"{g['name']} {g['memory_mib'] // 1024}GB sm{g['compute_cap']}" for g in p['gpus']) or 'none'
+    gpu = ', '.join(
+        f"{g['name']} "
+        + (f"{g['memory_mib'] // 1024}GB" if g['memory_mib'] is not None else 'memory N/A')
+        + (f" sm{g['compute_cap']}" if g['compute_cap'] else '')
+        for g in p['gpus']) or 'none'
+    uv_version = p['uv'] or 'absent'
+    if uv_version.startswith('uv '):
+        uv_version = uv_version[3:]
     lines = [
         f"platform {p['platform']}; python {p['python']} ({p['executable']}"
         + (', venv' if p['venv'] else '') + (', externally-managed' if p['externally_managed'] else '')
         + (', site read-only' if not p['site_writable'] else '')
         + (f", user site {p['user_site']}" if p['user_site'] else '') + ')',
-        f"installer: pip {p['pip']}; uv {p['uv'] or 'absent'}; internet {'yes' if p['online'] else 'NO'}",
+        f"installer: pip {p['pip']}; uv {uv_version}; internet {'yes' if p['online'] else 'NO'}",
         f"gpu: {gpu}; driver CUDA {p['driver_cuda']}",
         (f"torch {t.get('version')} (CUDA {t.get('cuda')}), cuda_available={t.get('cuda_available')}, "
          f"bf16={t.get('bf16')}" if 'version' in t else f"torch: {t.get('error', 'not installed')}"),
@@ -274,7 +290,8 @@ def requirement_name(line):
 
 
 def gpu_capability():
-    caps = [tuple(int(x) for x in g['compute_cap'].split('.')) for g in gpus() if g['compute_cap']]
+    caps = [tuple(int(x) for x in g['compute_cap'].split('.')) for g in gpus()
+            if g['compute_cap'] and re.fullmatch(r'\d+\.\d+', g['compute_cap'])]
     return min(caps) if caps else None
 
 
@@ -459,17 +476,22 @@ def satisfied_by(line, version):
             continue
         if op == '==':
             if want != version and want != base:
-                return False
+                if ('+' in want or not re.fullmatch(r'\d+(?:\.\d+)*', want)
+                        or not re.fullmatch(r'\d+(?:\.\d+)*', base)
+                        or compare_versions(vkey(base), vkey(want)) != 0):
+                    return False
             continue
         a, b = vkey(base), vkey(want.split('+')[0])
         if a is None or b is None:
             return True
         if op == '~=':
-            prefix = vkey('.'.join(want.split('.')[:-1]))
-            if a < b or a[:len(prefix)] != prefix:
+            prefix = b[:-1]
+            if compare_versions(a, b) < 0 or not compatible_prefix(a, prefix):
                 return False
             continue
-        if not {'>=': a >= b, '<=': a <= b, '!=': a != b, '>': a > b, '<': a < b}[op]:
+        comparison = compare_versions(a, b)
+        if not {'>=': comparison >= 0, '<=': comparison <= 0,
+                '!=': comparison != 0, '>': comparison > 0, '<': comparison < 0}[op]:
             return False
     return True
 
@@ -478,10 +500,22 @@ def vkey(v):
     parts = re.match(r'^(\d+(?:\.\d+)*)', v)
     if not parts:
         return None
-    nums = [int(x) for x in parts[1].split('.')]
-    while nums and nums[-1] == 0:
-        nums.pop()
-    return tuple(nums)
+    return tuple(int(x) for x in parts[1].split('.'))
+
+
+def compare_versions(a, b):
+    width = max(len(a), len(b))
+    a = a + (0,) * (width - len(a))
+    b = b + (0,) * (width - len(b))
+    return (a > b) - (a < b)
+
+
+def compatible_prefix(version, prefix):
+    """PEP 440 compatible release: equal release components before the last."""
+    if not prefix:
+        return True
+    candidate = version[:len(prefix)] + (0,) * max(0, len(prefix) - len(version))
+    return candidate == prefix
 
 
 def verify_torch(python):
@@ -496,6 +530,9 @@ def cmd_wheels(a):
     """Resolve REQ for the target described by --env, preferring the versions
     it already has, then download only what it lacks as wheels."""
     env = json.loads(Path(a.env).read_text())
+    if env.get('platform') == 'kaggle' and not env.get('kaggle_docker_image'):
+        say('WARNING: this Kaggle fingerprint has no immutable image digest; verify it was '
+            'captured on the same image as the target job')
     have = env['all_packages']
     uv = uv_path()
     if not uv:
@@ -558,12 +595,14 @@ def cmd_wheels(a):
                  '-d', str(out), '-q', f'{name}=={ver}'])
         if r.returncode:
             # Pure-Python sdists can be built here; anything with native code can't.
-            b = run([sys.executable, '-m', 'pip', 'wheel', '--no-deps', '-w', d, '-q', f'{name}=={ver}'])
-            built = list(Path(d).glob('*-py3-none-any.whl')) if b.returncode == 0 else []
-            if built:
-                for w in built:
-                    shutil.move(str(w), str(out / w.name))
-                continue
+            with tempfile.TemporaryDirectory() as fallback_dir:
+                b = run([sys.executable, '-m', 'pip', 'wheel', '--no-deps', '-w', fallback_dir,
+                         '-q', f'{name}=={ver}'])
+                built = list(Path(fallback_dir).glob('*-py3-none-any.whl')) if b.returncode == 0 else []
+                if built:
+                    for w in built:
+                        shutil.move(str(w), str(out / w.name))
+                    continue
             failed.append(f'{name}=={ver}')
     wheels = sorted(p.name for p in out.glob('*.whl'))
     say(f'{len(wheels)} wheels in {out} ({sum(p.stat().st_size for p in out.glob("*.whl")) / 1e6:.1f} MB)')

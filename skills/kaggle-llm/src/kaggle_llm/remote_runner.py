@@ -28,8 +28,11 @@ class CallError(Exception):
         self.status = status
 
 
-def _retryable(status):
-    return status is None or status == 429 or status >= 500
+def _retryable(status, *, after_probe=False):
+    # After the probe proved access, a 403 is almost always the proxy refusing a
+    # request that would push the job's in-flight reserved spend (max_tokens x
+    # price per call) over its budget, so it is retried like a 429.
+    return status is None or status == 429 or status >= 500 or (after_probe and status == 403)
 
 
 def proxy_call(model, payload, *, environ=os.environ, timeout=600):
@@ -104,7 +107,7 @@ def run_job(spec, call, out_path, *, environ=os.environ, sleep=time.sleep, clock
                    "rows_failed": state["failed"], "stopped_reason": stopped_reason})
             return summary
 
-        def attempt_call(model, payload):
+        def attempt_call(model, payload, after_probe=False):
             """Return (raw, None, attempts) or (None, error with .status, attempts). Sleeps only between attempts."""
             for attempt in range(1, max_attempts + 1):
                 try:
@@ -114,7 +117,7 @@ def run_job(spec, call, out_path, *, environ=os.environ, sleep=time.sleep, clock
                     # defines its own CallError, distinct from an injected caller's.
                     if not hasattr(exc, "status"):
                         raise
-                    if not _retryable(exc.status) or attempt == max_attempts:
+                    if not _retryable(exc.status, after_probe=after_probe) or attempt == max_attempts:
                         return None, exc, attempt
                     sleep(backoff * 2 ** (attempt - 1))
                     continue
@@ -154,7 +157,7 @@ def run_job(spec, call, out_path, *, environ=os.environ, sleep=time.sleep, clock
             try:
                 payload = {"messages": row["messages"], **spec.get("options", {})}
                 try:
-                    raw, error, attempts = attempt_call(model, payload)
+                    raw, error, attempts = attempt_call(model, payload, after_probe=True)
                 except Exception as exc:  # A bug or odd response must not lose the other rows.
                     raw, error, attempts = None, CallError(None, type(exc).__name__), 1
                 base = {"kind": "row", "line": row["line"], "id": row.get("id")}

@@ -32,17 +32,20 @@ installing anything, when:
 
 | | Local 4090 | Colab (G4 measured) | Kaggle T4 ×2 |
 |---|---|---|---|
+| image | local Ubuntu | Colab-managed G4 image | `gcr.io/kaggle-images/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461` |
 | Python | 3.12.3, system, externally managed | 3.13.15, `/usr`, root | 3.12.13, `/usr`, root |
 | torch | 2.11.0 (PyPI, CUDA 13.0) in `~/.local` | 2.11.0+cu128 | 2.10.0+cu128 |
-| driver CUDA | 13.0 | 13.0 | 13.0 (driver 580) |
+| driver CUDA | 13.0 | 13.0 | 13.0 (driver 580.159.04) |
 | installer | uv 0.12.7, pip 25.2 | uv 0.12.9 (`UV_SYSTEM_PYTHON=true`), pip 24.1.2 | uv 0.11.13 (`UV_SYSTEM_PYTHON=true`), pip 24.1.2 |
 | preinstalled | 574 dists, incl. transformers, peft, trl, vllm, flash-attn | 705 dists, incl. transformers 5.16, peft, accelerate, jax, tensorflow; no trl, bitsandbytes | 933 dists, incl. transformers 5.0, peft, accelerate, datasets, jax, tensorflow; no trl, bitsandbytes, vllm |
 | internet | yes | yes | only with `--internet` |
 | how to run | `envsetup install --venv .venv -r req.txt` | `cgpu setup S -- -r /content/p/req.txt` | `kgpu prepare ... --setup '-r req.txt'` |
 
-Measured 2026-09-27; images change. `probe` prints the current values, and
-`cgpu setup` / `kgpu --setup` run it on every use (Kaggle saves it as
-`out/env.json`).
+Measured 2026-09-27; images change. The Kaggle column is from a private
+`--setup` job on the pinned image digest shown in the table. It is the latest
+Kaggle Python default observed when this snapshot was pinned. `probe` prints
+current values, and `cgpu setup` / `kgpu --setup` run it on every use (Kaggle
+saves it as `out/env.json` and stamps `kaggle_docker_image`).
 
 ### Local
 
@@ -91,7 +94,11 @@ torch, both one release behind Colab. Measured on a T4 ×2 kernel with
 
 Without `--internet` nothing can be downloaded. Build the wheel set on this
 machine from the target's fingerprint, upload it as a private dataset, and
-install from the mount:
+install from the mount. The `env.json` must come from the same Docker image
+digest that the job will use: Python, glibc, and torch/CUDA versions affect the
+resolution. Keep the digest in `kaggle_docker_image` matched to the explicit
+`--docker-image` or the helper's pinned T4 default. Do not reuse an old
+fingerprint after changing images.
 
 ```bash
 envsetup wheels --env kaggle-env.json -o ./wheels -r requirements.txt
@@ -100,7 +107,8 @@ kgpu prepare ./job ... --dataset USER/wheels \
   --setup '-r requirements.txt --wheels /kaggle/input'   # searched recursively
 ```
 
-Measured 2026-09-27 on T4 ×2 with internet off: `wheels` fetched only
+Measured 2026-09-27 on T4 ×2 with internet off, using the pinned image digest
+listed above: `wheels` fetched only
 bitsandbytes 0.50.2 and trl 1.14.0 (44 MB). The private dataset mounted at
 `/kaggle/input/datasets/<owner>/<slug>/` as regular files, not symlinks, and
 their sizes and sha256s matched the local wheels. `install` ran uv with
@@ -108,7 +116,8 @@ their sizes and sha256s matched the local wheels. `install` ran uv with
 importing trl and bitsandbytes passed. The whole kernel took about 2 minutes
 from start to finish.
 
-`kaggle-env.json` is any Kaggle `out/env.json` from an earlier `--setup` run.
+`kaggle-env.json` is a Kaggle `out/env.json` from an earlier `--setup` run on
+the same pinned image digest.
 `wheels` resolves with uv for the target's Python and glibc, prefers the
 versions the target already has, and downloads only what differs. It
 resolves torch against PyTorch's own index (`--torch-backend cu128`) because

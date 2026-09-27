@@ -7,6 +7,7 @@ still worth checking on a real T4 after changing cgpu.
 """
 import json
 import os
+import runpy
 import signal
 import subprocess
 import sys
@@ -27,6 +28,15 @@ class CgpuTest(unittest.TestCase):
         bin_ = self.tmp / "bin"
         bin_.mkdir()
         (bin_ / "colab").symlink_to(HERE / "fake_colab.py")
+        nvidia = bin_ / "nvidia-smi"
+        nvidia.write_text(
+            "#!/bin/sh\n"
+            "case \"$*\" in\n"
+            "  *driver_version,compute_cap*) echo 'Tesla T4, 15360, 580.0, 7.5' ;;\n"
+            "  *name,memory.total*) echo 'Tesla T4, 15360' ;;\n"
+            "  *) echo 'CUDA Version: 13.0' ;;\n"
+            "esac\n")
+        nvidia.chmod(0o755)
         self.env = {**os.environ, "FAKE_COLAB": str(self.fake),
                     "HOME": str(self.tmp / "home"), "CGPU_START_WAIT": "4",
                     "PATH": f"{bin_}:{os.environ['PATH']}"}
@@ -88,11 +98,27 @@ class CgpuTest(unittest.TestCase):
         r = self.cgpu("setup", "s")
         self.assertIn("installer: pip", r.stdout)
         self.assertTrue((self.vm() / "content/.cgpu/env.json").exists())
-        # The fake runs cells on this machine, where envsetup refuses to
-        # touch the base interpreter: the exit code must survive the trip.
-        r = self.cgpu("setup", "s", "--", "requests", ok=False)
+        # The local-base and fake-sm75 guards both refuse before installing.
+        r = self.cgpu("setup", "s", "--", "flash-attn", ok=False)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("refusing to install into the base interpreter", r.stdout)
+        self.assertTrue(any(message in r.stdout for message in (
+            "refusing to install into the base interpreter", "needs compute capability >= 8.0")))
+
+    def test_setup_probe_failure_skips_install(self):
+        self.cgpu("up", "s", "T4")
+        fixture = self.tmp / "failing-envsetup"
+        fixture.write_text(
+            "import pathlib, sys\n"
+            "if sys.argv[1] == 'probe':\n"
+            "    print('simulated probe failure')\n"
+            "    raise SystemExit(7)\n"
+            "if sys.argv[1] == 'install':\n"
+            "    pathlib.Path(__file__).with_name('install-ran').write_text('yes')\n")
+        r = self.cgpu("setup", "s", "--", "requests", ok=False,
+                      env={"FAKE_COLAB_ENVSETUP": str(fixture)})
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        self.assertIn("simulated probe failure", r.stdout)
+        self.assertFalse((self.vm() / "tmp/install-ran").exists())
 
     def test_setup_refused_mid_job(self):
         self.cgpu("up", "s", "T4")
@@ -142,6 +168,24 @@ class CgpuTest(unittest.TestCase):
         self.cgpu("start", "s", "--", "sleep", "30")
         r = self.cgpu("start", "s", "--", "true", ok=False)
         self.assertIn("still running", r.stderr)
+
+    def test_kill_reports_finished_job_without_signalling(self):
+        self.cgpu("up", "s", "T4")
+        self.cgpu("start", "s", "--", "true")
+        self.cgpu("wait", "s", "--poll", "1")
+        n = len(self.calls())
+        r = self.cgpu("kill", "s")
+        self.assertIn("already finished", r.stdout)
+        self.assertNotIn("console", [c[0] for c in self.calls()[n:]])
+
+    def test_kill_escalates_when_process_ignores_sigterm(self):
+        self.cgpu("up", "s", "T4")
+        self.cgpu("start", "s", "--", sys.executable, "-c",
+                  "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)")
+        r = self.cgpu("kill", "s", env={"CGPU_TERM_GRACE": "0.3", "CGPU_KILL_WAIT": "3"})
+        self.assertIn("required SIGKILL", r.stdout)
+        self.assertEqual([c[0] for c in self.calls()].count("console"), 2)
+        self.assertIn("exit=-9", r.stdout)
 
     # ---------------------------------------------------------------- up
 
@@ -200,6 +244,62 @@ class CgpuTest(unittest.TestCase):
         self.assertNotIn("exec", [c[0] for c in self.calls()[n:]])
         # A single file still works mid-job.
         self.cgpu("pull", "s", "/content/ckpt/last.pt", "got/")
+
+    # ---------------------------------------------------------------- push
+
+    def test_push_filters_gitignored_data_and_credentials(self):
+        self.cgpu("up", "s", "T4")
+        project = self.tmp / "project"
+        project.mkdir()
+        (project / "safe.py").write_text("print('safe')\n")
+        (project / ".gitignore").write_text("large-data.bin\n")
+        (project / ".env").write_text("SECRET=value\n")
+        (project / "credential.pem").write_text("private key\n")
+        (project / "large-data.bin").write_bytes(b"data")
+        (project / ".ssh").mkdir()
+        (project / ".ssh" / "id_rsa").write_text("private key\n")
+        subprocess.run(["git", "init", "-q", str(project)], check=True)
+        subprocess.run(["git", "-C", str(project), "add", ".gitignore", "safe.py"], check=True)
+        self.cgpu("push", "s", str(project), "/content/project")
+        remote = self.vm() / "content/project"
+        self.assertTrue((remote / "safe.py").exists())
+        self.assertTrue((remote / ".gitignore").exists())
+        for name in (".env", "credential.pem", "large-data.bin", ".ssh/id_rsa"):
+            self.assertFalse((remote / name).exists(), name)
+        self.assertFalse(list((self.vm() / "tmp").glob("cgpu-push-*")))
+
+    def test_push_directory_refuses_before_remote_upload_during_job(self):
+        self.cgpu("up", "s", "T4")
+        project = self.tmp / "project"
+        project.mkdir()
+        (project / "code.py").write_text("pass\n")
+        self.cgpu("start", "s", "--", "sleep", "30")
+        n = len(self.calls())
+        r = self.cgpu("push", "s", str(project), ok=False)
+        self.assertIn("idle kernel", r.stderr)
+        self.assertNotIn("upload", [c[0] for c in self.calls()[n:]])
+        self.assertFalse(list((self.vm() / "tmp").glob("cgpu-push-*")))
+
+    def test_push_large_file_refuses_before_upload_during_job(self):
+        self.cgpu("up", "s", "T4")
+        large = self.tmp / "large.bin"
+        with large.open("wb") as f:
+            f.truncate(40 * 1000 * 1000 + 1)
+        self.cgpu("start", "s", "--", "sleep", "30")
+        n = len(self.calls())
+        r = self.cgpu("push", "s", str(large), ok=False)
+        self.assertIn("idle kernel", r.stderr)
+        self.assertNotIn("upload", [c[0] for c in self.calls()[n:]])
+
+    def test_fake_path_rewrite_preserves_python_under_root(self):
+        with patch.dict(os.environ, {"FAKE_COLAB": str(self.fake)}):
+            rewrite = runpy.run_path(str(HERE / "fake_colab.py"))["rewrite"]
+        vm = self.fake / "vms" / "vm"
+        code = "cmd=['/root/.venv/bin/python', '/content/project/train.py', '/tmp/cgpu-part-x']"
+        rewritten = rewrite(vm, code)
+        self.assertIn("'/root/.venv/bin/python'", rewritten)
+        self.assertIn(str(vm / "fs/content/project/train.py"), rewritten)
+        self.assertIn(str(vm / "fs/tmp/cgpu-part-x"), rewritten)
 
     def test_interrupted_pull_keeps_previous_copy(self):
         self.pull_setup()

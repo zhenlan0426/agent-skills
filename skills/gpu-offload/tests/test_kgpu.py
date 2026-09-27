@@ -61,10 +61,10 @@ class HelperTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 kg.bundle(self.project, [])
 
-    def run_generated(self, command, gpu=False, setup=None):
+    def run_generated(self, command, gpu=False, setup=None, docker_image=None):
         payload, _ = kg.bundle(self.project, [])
         working = self.root / 'remote'
-        script = kg.runner(payload, command, 'test-run', gpu, setup)
+        script = kg.runner(payload, command, 'test-run', gpu, setup, docker_image)
         # Runtime substitutions isolate Kaggle's absolute output root and /tmp.
         script = script.replace("pathlib.Path('/kaggle/working')", f'pathlib.Path({str(working)!r})')
         script = script.replace("pathlib.Path('/tmp/kgpu-envsetup')",
@@ -164,18 +164,41 @@ class HelperTests(unittest.TestCase):
             'import os, pathlib\n'
             'pathlib.Path(os.environ["KGPU_OUTPUT_DIR"], "ran").write_text("yes")\n')
         fake = ('import pathlib, sys\n'
+                'if sys.argv[1] == "probe":\n'
+                '    pathlib.Path(sys.argv[sys.argv.index("--json") + 1]).write_text("{}")\n'
                 'if sys.argv[1] == "install":\n'
                 '    pathlib.Path(sys.argv[sys.argv.index("--report") + 1]).write_text(" ".join(sys.argv[2:]))\n'
                 '    sys.exit(int(sys.argv[2]))\n')
         for code in (0, 3):
             run, working = self.run_generated([sys.executable, 'train.py'],
-                                              setup=(fake, [str(code), '-r', 'req.txt']))
+                                              setup=(fake, [str(code), '-r', 'req.txt']),
+                                              docker_image=kg.DEFAULT_T4_DOCKER_IMAGE)
             result = json.loads((working / 'kgpu-result.json').read_text())
+            env = json.loads((working / 'out/env.json').read_text())
+            self.assertEqual(env['kaggle_docker_image'], kg.DEFAULT_T4_DOCKER_IMAGE)
             self.assertEqual(result['setup_exit_code'], code)
             self.assertEqual(result['exit_code'], code)
             self.assertEqual((working / 'out/ran').exists(), code == 0, run.stdout)
             self.assertTrue((working / 'out/envsetup.json').read_text().startswith(f'{code} -r req.txt'))
             subprocess.run(['rm', '-rf', str(working)])
+
+    def test_setup_probe_failure_skips_install_and_command(self):
+        (self.project / 'train.py').write_text(
+            'import os, pathlib\n'
+            'pathlib.Path(os.environ["KGPU_OUTPUT_DIR"], "ran").write_text("yes")\n')
+        fake = ('import pathlib, sys\n'
+                'if sys.argv[1] == "probe":\n'
+                '    raise SystemExit(9)\n'
+                'if sys.argv[1] == "install":\n'
+                '    pathlib.Path(sys.argv[sys.argv.index("--report") + 1]).write_text("installed")\n')
+        run, working = self.run_generated([sys.executable, 'train.py'],
+                                          setup=(fake, ['-r', 'req.txt']))
+        result = json.loads((working / 'kgpu-result.json').read_text())
+        self.assertEqual(result['probe_exit_code'], 9)
+        self.assertEqual(result['setup_exit_code'], 9)
+        self.assertFalse((working / 'out/envsetup.json').exists())
+        self.assertFalse((working / 'out/ran').exists())
+        self.assertNotEqual(run.returncode, 0)
 
     def test_setup_needs_internet_or_wheels(self):
         self.args.setup = '-r requirements.txt'
@@ -184,6 +207,55 @@ class HelperTests(unittest.TestCase):
         self.args.setup = '-r requirements.txt --wheels /kaggle/input/wheels'
         self.assertEqual(self.prepare()['setup'], ['-r', 'requirements.txt', '--wheels', '/kaggle/input/wheels'])
         self.assertIn('def cmd_install', (self.job / 'kernel.py').read_text())
+
+    def test_t4_default_image_is_the_current_pinned_snapshot(self):
+        self.args.accelerator = 'NvidiaTeslaT4'
+        job = self.prepare()
+        metadata = json.loads((self.job / 'kernel-metadata.json').read_text())
+        self.assertEqual(job['docker_image'], kg.DEFAULT_T4_DOCKER_IMAGE)
+        self.assertEqual(metadata['docker_image'], kg.DEFAULT_T4_DOCKER_IMAGE)
+
+    def test_docker_image_override(self):
+        self.args.accelerator = 'NvidiaTeslaT4'
+        self.args.docker_image = 'gcr.io/example/python@sha256:custom'
+        job = self.prepare()
+        metadata = json.loads((self.job / 'kernel-metadata.json').read_text())
+        self.assertEqual(job['docker_image'], self.args.docker_image)
+        self.assertEqual(metadata['docker_image'], self.args.docker_image)
+
+    def test_use_kaggle_default_image_leaves_image_unset(self):
+        self.args.accelerator = 'NvidiaTeslaT4'
+        self.args.use_kaggle_default_image = True
+        job = self.prepare()
+        metadata = json.loads((self.job / 'kernel-metadata.json').read_text())
+        self.assertIsNone(job['docker_image'])
+        self.assertNotIn('docker_image', metadata)
+
+    def test_image_flags_are_parsed_and_mutually_exclusive(self):
+        parsed = []
+
+        def capture(args, command):
+            parsed.append((args, command))
+
+        common = ['prepare', str(self.job), '--project', str(self.project), '--owner', 'testuser',
+                  '--accelerator', 'NvidiaTeslaT4']
+        for option, value in [('--docker-image', 'gcr.io/example/python@sha256:custom'),
+                              ('--use-kaggle-default-image', None)]:
+            argv = ['kgpu', *common, option]
+            if value:
+                argv.append(value)
+            argv += ['--', 'python', 'train.py']
+            with patch.dict(G, {'prepare': capture}), patch.object(sys, 'argv', argv):
+                kg.main()
+        self.assertEqual(parsed[0][0].docker_image, 'gcr.io/example/python@sha256:custom')
+        self.assertFalse(parsed[0][0].use_kaggle_default_image)
+        self.assertIsNone(parsed[1][0].docker_image)
+        self.assertTrue(parsed[1][0].use_kaggle_default_image)
+        bad_argv = ['kgpu', *common, '--docker-image', 'x', '--use-kaggle-default-image',
+                    '--', 'python', 'train.py']
+        with patch.dict(G, {'prepare': capture}), patch.object(sys, 'argv', bad_argv), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            kg.main()
 
     def test_executable_permission_preserved(self):
         executable = self.project / 'run.sh'

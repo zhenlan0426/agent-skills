@@ -18,14 +18,15 @@ import zipfile
 EXCLUDED = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.pytest_cache',
             '.mypy_cache', '.ipynb_checkpoints', '.kaggle', '.ssh', '.aws', '.cache',
             '.env', '.envrc', '.netrc', 'kaggle.json', 'access_token', 'credentials.json'}
-# Live transport validation and failure evidence: references/kaggle-cli-notes.md.
+# CLI caveats: references/kaggle-cli-notes.md; investigation log: docs/.
 COMPRESSED_LIMIT = 512 * 1024
 SOURCE_LIMIT = 704 * 1024
 UNPACKED_LIMIT = 20 * 1024 * 1024
-# The image used by the working aas-capture submitter and matched T4 probes.
+# Latest Kaggle Python image observed on 2026-09-27; pin this snapshot so
+# prepared T4 jobs and their dependency fingerprints stay reproducible.
 DEFAULT_T4_DOCKER_IMAGE = (
-    'gcr.io/kaggle-private-byod/python@sha256:'
-    '57e612b484cf3df5026ee4dcc3cb176974b22b2bc0937fb1e16132a8be4cb13c'
+    'gcr.io/kaggle-images/python@sha256:'
+    '37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461'
 )
 ENVSETUP = Path(__file__).resolve().parent / 'envsetup'
 
@@ -117,7 +118,7 @@ def check_source_size(source):
     return size
 
 
-def runner(payload, command, run_id, gpu, setup=None):
+def runner(payload, command, run_id, gpu, setup=None, docker_image=None):
     # Constants are emitted as Python literals, never interpolated into a shell.
     # `setup` is envsetup's source plus its install arguments; it runs before the
     # command, and a failed install fails the job without running the command.
@@ -147,10 +148,18 @@ try:
     if {setup_args!r} is not None:
         tool = pathlib.Path('/tmp/kgpu-envsetup')
         tool.write_text({envsetup!r})
-        subprocess.run([sys.executable, str(tool), 'probe', '--json', str(root / 'out' / 'env.json')])
-        result['setup_exit_code'] = subprocess.run(
-            [sys.executable, str(tool), 'install', *{setup_args!r},
-             '--report', str(root / 'out' / 'envsetup.json')]).returncode
+        result['probe_exit_code'] = subprocess.run(
+            [sys.executable, str(tool), 'probe', '--json', str(root / 'out' / 'env.json')]).returncode
+        if result['probe_exit_code']:
+            result['setup_exit_code'] = result['probe_exit_code']
+        else:
+            env_path = root / 'out' / 'env.json'
+            env = json.loads(env_path.read_text())
+            env['kaggle_docker_image'] = {docker_image!r}
+            env_path.write_text(json.dumps(env, indent=2) + '\\n')
+            result['setup_exit_code'] = subprocess.run(
+                [sys.executable, str(tool), 'install', *{setup_args!r},
+                 '--report', str(root / 'out' / 'envsetup.json')]).returncode
     if result.get('setup_exit_code'):
         print('kgpu: environment setup failed; command not run', flush=True)
         result['exit_code'] = result['setup_exit_code']
@@ -203,7 +212,7 @@ def prepare(args, command):
                     kernel_sources=args.kernel_source, model_sources=[])
     if docker_image is not None:
         metadata['docker_image'] = docker_image
-    source = runner(payload, command, run_id, gpu, setup).encode('utf-8')
+    source = runner(payload, command, run_id, gpu, setup, docker_image).encode('utf-8')
     source_bytes = check_source_size(source)
     sizes = dict(compressed_bytes=len(base64.b64decode(payload)), base64_bytes=len(payload),
                  unpacked_bytes=sum(f['bytes'] for f in manifest), source_bytes=source_bytes)
@@ -370,9 +379,9 @@ def main():
     prep.add_argument('--run-timeout', type=positive, default=3600, help='remote runtime limit in seconds (default 3600)')
     prep.add_argument('--internet', action='store_true', help='enable network in the kernel')
     image = prep.add_mutually_exclusive_group()
-    image.add_argument('--docker-image', help='Kaggle-provided image digest; T4 defaults to a tested pinned image')
+    image.add_argument('--docker-image', help='Kaggle-provided image digest; T4 defaults to the pinned Kaggle Python snapshot')
     image.add_argument('--use-kaggle-default-image', action='store_true',
-                       help='leave docker_image unset instead of using the tested T4 default')
+                       help='leave docker_image unset to follow Kaggle current default')
     prep.add_argument('--setup', metavar="'ARGS'",
                       help="run `envsetup install ARGS` before the command, e.g. "
                            "--setup '-r requirements.txt --skip flash-attn'")

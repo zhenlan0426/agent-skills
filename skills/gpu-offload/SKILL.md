@@ -25,7 +25,7 @@ there. For the second part, read the target's reference file:
 |---|---|---|---|
 | **Local 4090** | 24GB on one card; bf16, FlashAttention 2 | free | 1× |
 | **Kaggle T4 ×2** | 2 × 16GB separate cards; fp16 only (no bf16), no FlashAttention 2 | free; weekly quota that resets and expires unused; queue waits; runs capped at about 12h | several times slower |
-| **Colab G4** | 96GB on one card (RTX PRO 6000 Blackwell; bf16/fp8) | 8.90 CU/hr from a balance that expires at month end; about 15 min billed minimum per `up` | faster |
+| **Colab G4** | 96GB on one card (RTX PRO 6000 Blackwell; bf16/fp8) | 8.90 CU/hr from a balance that expires at month end; observed charges suggest a ~15 min minimum per `up` (inferred) | faster |
 
 Colab's A100 high-mem (6.77 CU/hr, VRAM unverified, hung once in testing), L4,
 and T4 are worse value than G4, the 4090, and Kaggle respectively. Use them
@@ -40,21 +40,27 @@ and fp16 can overflow on models built for bf16).
 ## Choosing
 
 1. **The user named a target:** use it, with no justification needed.
-2. **Fits locally and the 4090 is free:** run locally. "Fits" includes
-   standard techniques that don't change what is being computed: smaller
-   micro-batch with gradient accumulation, gradient checkpointing, 8-bit
-   optimizer states, CPU offload into the 94GB of RAM.
-3. **Fits locally but the 4090 is occupied** (another process holds memory or
-   compute it needs, per `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv`),
-   or the user wants it to run in parallel: use **Kaggle**. No permission
-   needed. The quota is free and resets weekly, so unused hours are lost.
-4. **Doesn't fit in 24GB:** use **Kaggle** if it fits split across 2 × 16GB,
-   works in fp16, and can run at T4 speed within about 12h. Otherwise use
-   **Colab G4**.
+2. **Fits locally and the 4090 is free:** run locally. For this routing
+   decision, "fits locally" means it runs on one 24GB card in bf16 with
+   FlashAttention 2. Include standard techniques that do not change the
+   computation: smaller micro-batches with gradient accumulation, gradient
+   checkpointing, 8-bit optimizer states, or CPU offload into 94GB of RAM.
+3. **Fits locally but the 4090 is occupied**, or the user wants parallel work:
+   use **Kaggle only if** the job can be split across two separate 16GB T4s,
+   runs correctly in fp16 without FlashAttention 2, and is expected to finish
+   within about 12h at T4 speed. T4s are several times slower than the 4090 and
+   jobs can queue, so waiting for the 4090 often finishes sooner. If any Kaggle
+   check fails, wait for the 4090 or ask the user. The free weekly quota resets,
+   so unused hours are lost.
+4. **Doesn't fit in 24GB:** use **Kaggle** only when it passes those same three
+   checks; otherwise use **Colab G4**.
 
-Kaggle also mirrors the scoring environment for code competitions. Some
-competitions allow larger accelerators, so check the competition's code
-requirements before choosing a shape.
+Kaggle's unmodified default kernel image mirrors the scoring environment for
+code competitions. The T4 helper pins a Kaggle image snapshot so its packages
+stay reproducible; that snapshot can stop matching scoring after Kaggle updates
+its default. Use `kgpu prepare --use-kaggle-default-image` when current scoring
+parity matters, and check the competition's code requirements before choosing
+a shape.
 
 When the only way to fit locally changes the method or results (QLoRA instead
 of bf16 LoRA, 4-bit instead of bf16 weights, a shorter context), that

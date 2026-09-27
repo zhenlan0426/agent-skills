@@ -156,7 +156,7 @@ each line under a lock:
    `model: null` and the correct `row_count`. (This is used by experiments E1/E2.)
 4. **Probe.** Try candidates in order with `PROBE_MESSAGES` and `max_tokens: 256`.
    - Success: pin that model and record probe status 200.
-   - Retryable failure (status 429, ≥ 500, or `None`): retry up to
+   - Retryable failure (status 429, ≥ 500, or `None`; 403 is **not** retryable in the probe): retry up to
      `max_attempts` with backoff, then move to the next candidate.
    - Any other failure: move on immediately.
    - Record the last status per candidate tried.
@@ -169,6 +169,8 @@ each line under a lock:
    Rows never dispatched get **no line**. Per row:
    - retry retryable failures up to `max_attempts`
      (`sleep(backoff_seconds * 2**(attempt-1))`)
+   - 403 is also retryable for rows, once the probe succeeded (the proxy's in-flight
+     spend budget; see the section 6 log)
    - fail immediately on other statuses
    - write `{"kind":"row","line","id","ok":true,"raw":<completion>,"attempts"}` or
      `{"kind":"row","line","id","ok":false,"status","error","attempts"}`
@@ -209,8 +211,8 @@ class JobStore:
     def list(self) -> list[dict]
 
 def prepare_job(rows, *, catalog, system=None, schema=None, schema_mode="prompt",
-                model=None, max_tokens=None, temperature=None, reasoning=None,
-                concurrency=8, max_attempts=4, max_cost_usd=None,
+                model=None, max_tokens=16000, temperature=None, reasoning=None,
+                concurrency=8, max_attempts=4, max_cost_usd=10.0,
                 deadline_seconds=DEFAULT_DEADLINE, dedup=True, threshold=0.85,
                 execute_in="creation") -> tuple[dict, list[dict]]
 def render_task(spec, *, slug=SLUG) -> str
@@ -316,7 +318,7 @@ def summary(store, job_id) -> dict
 
 ```
 kaggle-llm batch INPUT --remote [--model M] [--system S] [--schema F] [--schema-mode prompt|native]
-    [--max-tokens N] [--temperature T] [--reasoning R] [--concurrency 8] [--max-cost USD]
+    [--max-tokens 16000] [--temperature T] [--reasoning R] [--concurrency 8] [--max-cost 10]
     [--no-dedup] [--detach] [--wait-timeout 3600] [--execute-in creation|run]
 kaggle-llm remote status JOB      # summary JSON on stdout
 kaggle-llm remote collect JOB [--wait-timeout S]   # waits if needed, then result rows on stdout
@@ -645,6 +647,110 @@ notebooks were 12-13 KB. `Public: False` was confirmed after every push.
   reserves spend per request against the request's maximum output, which is
   huge without `max_tokens`, and rejects requests over a budget with 403. The
   probe (`max_tokens` 256) always passes. Stopped again pending the user.
+
+### Debugging the 403s (2026-09-27, user: "run any test you need to debug")
+All GPT-6 Astra, pushed through `kaggle-llm batch --remote` with the pre-flight
+wrapper; every push was verified private by `submit`.
+
+| Job | Version | Rows | `--max-tokens` | Concurrency | Result | Cost |
+|---|---|---|---|---|---|---|
+| `1beecc6887f0` | 8 | 47 (step 1 input) | 1024 | 8 | 47 ok, exit 0 | $0.218 |
+| `bf734840fd5d` | 9 | 5 | none | 1 | 5 ok | $0.032 |
+| `22164e4d9223` | 10 | 16 | 32000 | 8 | 6 ok, 10 × 403 | $0.027 |
+| `aef1873f692d` | 11 | 16 | 16000 | 8 | 16 ok (as predicted) | $0.069 |
+
+- Mechanism (inferred from these runs; not documented by Kaggle): the proxy
+  admits concurrent requests up to a budget of reserved spend, where each
+  in-flight request reserves roughly `max_tokens` (or the model's maximum
+  output when unset) × the output price, and it rejects the rest at once with
+  **403**, not 429. At about $50 per M output tokens, the 32000-token run
+  admitted 6 of the first 8 (6 × $1.60 = $9.60 fits, 7 × $1.60 = $11.20 does
+  not), and the rows dispatched into the slots freed by the instant 403s were
+  all rejected while those 6 were in flight. Uncapped, only 1 request is
+  admitted. So the budget is about $10 of in-flight reservation, which is
+  consistent with all four runs and with E3/E4 (caps 512/256).
+- Actual usage is tiny compared with the reservation: the 47 step 1 answers
+  used at most 206 completion tokens (4153 total), all `finish_reason: stop`.
+- Consequences: (1) a remote job without `--max-tokens` fails almost every row
+  at any concurrency above 1; (2) in the kernel, a 403 after a successful
+  probe is usually this capacity rejection, not a permission loss, but the
+  runner treats it as final; (3) the safe concurrency depends on
+  `max_tokens` × the model's price, so E4's "concurrency 8" holds only for small
+  caps. The Model Proxy's budget and prices are not queryable from the CLI.
+- Fix pending the user's decision; acceptance steps 1-4 as written (no
+  `--max-tokens`) cannot pass without one. Step 1 passes with `--max-tokens 1024`.
+
+### Fix for the in-flight budget (2026-09-27)
+- User's decision: default token cap **and** 403 retry, "with higher cap for
+  max tokens and dollar cap". The values were not specified; I chose them:
+  `DEFAULT_MAX_TOKENS = 16000` (the largest cap measured clean 8-wide on
+  GPT-6 Astra) and `DEFAULT_MAX_COST_USD = 10.0`, both `prepare_job` defaults
+  (`None` sends no cap) that the CLI applies when `--max-tokens`/`--max-cost` are
+  omitted. Local calls are unchanged (no cap).
+- Runner: `_retryable(status, after_probe=True)` also retries 403, for rows only.
+  During the probe, a 403 still means "unavailable, try the next candidate".
+  A real mid-job revocation now costs up to 3 backoffs (5+10+20 s) per
+  in-flight row before failing.
+- Tests added: `RunnerTests.test_row_403_after_probe_is_retried`,
+  `test_probe_403_moves_on_without_retrying`,
+  `PrepareJobTests.test_remote_defaults_cap_tokens_and_cost`,
+  `CliRemoteTests.test_batch_remote_default_caps`. No existing assertion
+  changed; 95 tests pass.
+- Docs: SKILL.md (defaults, the budget, 403 retry), api.md (flags, kernel
+  retry rule, measured budget, resume inherits caps, Python defaults), and
+  sections 3.5, 3.6, 3.7 here.
+
+### Phase 5: acceptance (2026-09-27, 20:29-20:37Z, after the fix)
+Input `prompts50.jsonl` as in the stopped run above (50 prompts, 3
+near-duplicates). Every push was pre-flighted on its real spec by wrapping
+`remote.submit` (12-16 KB notebooks), and `submit` verified privacy.
+
+1. `batch prompts50.jsonl --remote --max-cost 2` (no `--max-tokens`, so the
+   16000 default): job `4d6d4cc98af9`, version 12. **47 rows, all ok**, 0 retries,
+   `model: openai/gpt-6-astra` (= `best.rank(fetch_catalog())[0]`),
+   `dropped_duplicates: 3`, `cost_usd` 0.2166, exit 0. Pass.
+2. Same with `--schema` (`{answer: string, topic: string}`, both required, no
+   extra keys): job `e9bccdb9501e`. 47 ok, `structured_output` with exactly
+   both keys on every row, `cost_usd` 0.2620, exit 0. Pass. No row failed the
+   schema, so the live schema-error path was not exercised (covered by
+   `test_schema_validated_locally`).
+3. `--detach` on a 5-row file (to keep spend minimal; the step checks format):
+   printed `{"job_id": "5495f4107ee0"}`, exit 0; `remote status` →
+   `submitted`; `remote collect` waited, then printed 5 ok rows whose row and
+   result keys match step 1's; exit 0; status then `downloaded`,
+   `cost_usd` 0.0324. Pass.
+4. `--max-cost 0.001`: job `4632b8767580`. `stopped_reason: max_cost`,
+   8 rows ok, **39 `not run (stopped: max_cost)`**, exit 1. The 8 were the
+   first concurrent dispatch, sent before any cost came back (in-flight rows
+   finish; spend $0.0456). `remote resume 4632b8767580 --max-cost 2`: child
+   `977c992210b9`, version 16, 39 rows ok, merged output **47/47 ok with the
+   original line numbers and ids** (identical to step 1's), exit 0. Pass.
+5. `kaggle b t status kaggle-llm-batch`: version 16, Completed,
+   `Public: False`. Pass.
+6. `kaggle-llm batch small.jsonl` (3 rows, no `--remote`): 3 ok on
+   `anthropic/claude-sonnet-5@default`, exit 0, no task version created. Pass.
+
+Phase 5 spend: about $0.73. Total proxy spend today: about $1.2.
+
+### E2: kernel wall-clock limit (started 2026-09-27 20:38:17Z; in progress)
+- Spec: `dry_run {"sleep_seconds": 43200, "heartbeat_seconds": 300}`, 1 row,
+  no model calls, job `d46ea9d7b97f`, 12 KB notebook. Pre-flight: validator and
+  converter passed; the notebook's code ran with `FakeTime` patched over
+  `time.sleep`/`time.monotonic` (145 heartbeats to 43200 s, `end: dry_run`,
+  0 calls).
+- Pushed with `kaggle b t push` (no wait): version 17; at 20:39:19Z
+  `Status: Running`, `Public: False`, no run listed yet.
+- **Remote jobs cannot be pushed until this creation ends** (by about 08:40Z on
+  2026-09-28, or earlier if Kaggle kills it).
+- To finish: when `kaggle b t status kaggle-llm-batch` is no longer
+  Queued/Running, `kaggle b t download kaggle-llm-batch -o <dir>`, then read
+  `kaggle_llm_results.jsonl`. With an `end` line (`stopped_reason: dry_run`),
+  the limit is at least 12 h: keep `DEFAULT_DEADLINE` = 42300 (12 h - 15 min)
+  or leave 39600. Without one, the last heartbeat's `elapsed` is the limit
+  (±300 s): set `DEFAULT_DEADLINE` = last heartbeat - 900. If nothing is
+  downloadable after a kill, record that partial results of killed runs are
+  lost, and treat the deadline as the only protection. `DEFAULT_WAIT_TIMEOUT`
+  (3600 s) stays: the acceptance jobs took 70-100 s.
 
 ## 7. Acceptance (Phase 5)
 

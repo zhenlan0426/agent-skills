@@ -21,7 +21,7 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
   table in [../SKILL.md](../SKILL.md)). Measured on this account (Colab Pro,
   2026-09-27; rates in compute units per hour):
 
-  | `--gpu` | GPU | VRAM | vCPU / RAM | CU/hr |
+  | `cgpu up` GPU argument | GPU | VRAM | vCPU / RAM | CU/hr |
   |---|---|---|---|---|
   | T4 | Tesla T4 | 16GB | 2 / 13GB (high-mem: 8 / 53GB) | 1.07 (1.27) |
   | L4 | L4 | 24GB | 12 / 56GB | 1.54 |
@@ -51,7 +51,7 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
 ## Workflow
 
 ```bash
-cgpu up job1 A100                              # add --high-mem for high-RAM shape
+cgpu up job1 G4                                # recommended; add --high-mem only when needed
 cgpu push job1 ./myproj                        # -> /content/myproj (.git, venvs, caches excluded)
 cgpu secrets job1 kaggle hf                    # only if the job needs them
 cgpu setup job1 -- -r /content/myproj/requirements.txt   # keeps the image's torch; see environments.md
@@ -73,12 +73,15 @@ cgpu down job1                                 # always, once results are safe (
   poll with `cgpu logs` every few minutes. `logs` only ever reads a 256KB tail
   the VM keeps up to date (about every 2s), so polling stays cheap for verbose
   jobs; it says so when the tail holds fewer lines than asked for. `--full`
-  fetches the whole log. `cgpu kill` stops the job but keeps the VM.
+  fetches the whole log. `cgpu kill` sends SIGTERM, waits 5 seconds, escalates
+  to SIGKILL if needed, and reports the final job status. The VM stays up.
 - **One job at a time per session.** `start` refuses while the session's
   previous job is still running. The job occupies the kernel, so `sh`,
-  `secrets`, `push`, and directory `pull` refuse until it ends (a queued cell
-  would still run after its client gave up). `logs`, `kill`, and single-file
-  `pull` work mid-job. Use a second session for parallel work.
+  `secrets`, directory pushes, pushes over 40MB, and directory `pull` refuse
+  until it ends (a queued cell would still run after its client gave up).
+  `logs`, `kill`, small-file pushes, and single-file `pull` work mid-job. Use a
+  second session for parallel work. Directory pushes respect Git ignore rules
+  and exclude common credentials; use `cgpu secrets` for Kaggle or HF access.
 - If `start` can't confirm the job left the kernel queue within 3 minutes, it
   cancels it, so it can't run later unnoticed, and says so. Retrying is then
   safe. An interrupted `start` is settled the same way by the next one.

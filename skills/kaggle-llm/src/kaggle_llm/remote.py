@@ -39,6 +39,12 @@ MAX_SOURCE_BYTES = 1_000_000
 MAX_PAYLOAD_BYTES = 950_000
 SPEC_VERSION = 1
 DEFAULT_CONCURRENCY = 8  # E4: 0 retries in 40 rows at both 4 and 8
+# The proxy rejects (403) calls that would push a job's in-flight reserved spend,
+# about max_tokens x output price per call, over roughly $10. Uncapped calls
+# reserve the model's whole output limit, so only one fits. 16000 tokens ran
+# clean 8-wide on GPT-6 Astra; see the plan log.
+DEFAULT_MAX_TOKENS = 16000
+DEFAULT_MAX_COST_USD = 10.0
 BACKOFF_SECONDS = 5.0
 MAX_CONCURRENCY = 16
 RESUME_OVERRIDES = ("max_cost_usd", "concurrency", "deadline_seconds")
@@ -59,11 +65,14 @@ class RunInfo(NamedTuple):
 
 
 def prepare_job(rows, *, catalog, system=None, schema=None, schema_mode="prompt",
-                model=None, max_tokens=None, temperature=None, reasoning=None,
-                concurrency=DEFAULT_CONCURRENCY, max_attempts=4, max_cost_usd=None,
+                model=None, max_tokens=DEFAULT_MAX_TOKENS, temperature=None, reasoning=None,
+                concurrency=DEFAULT_CONCURRENCY, max_attempts=4, max_cost_usd=DEFAULT_MAX_COST_USD,
                 deadline_seconds=DEFAULT_DEADLINE, dedup=True, threshold=0.85,
                 execute_in="creation"):
-    """Build a job spec from {"line","id","prompt"} rows. Returns (spec, dropped duplicates)."""
+    """Build a job spec from {"line","id","prompt"} rows. Returns (spec, dropped duplicates).
+
+    Unlike local calls, max_tokens and max_cost_usd have defaults; pass None to send no cap.
+    """
     if execute_in not in ("creation", "run"):
         raise ValueError("execute_in must be creation or run")
     if type(concurrency) is not int or not 1 <= concurrency <= MAX_CONCURRENCY:

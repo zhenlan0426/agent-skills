@@ -43,9 +43,11 @@ class RequirementParsing(unittest.TestCase):
 
     def test_satisfied_by(self):
         v = '2.11.0+cu128'
-        yes = ['torch', 'torch>=2.3', 'torch==2.11.0', 'torch==2.11.*', 'torch~=2.11',
+        yes = ['torch', 'torch>=2.3', 'torch==2.11.0', 'torch==2.11', 'torch==2.11.*', 'torch~=2.11',
+               'torch~=2.11.0',
                'torch<3,>=2.10', 'torch!=2.10.0', 'torch==2.11.0+cu128', 'torch @ https://x']
-        no = ['torch==2.4.0', 'torch<2.11', 'torch>2.11', 'torch==2.10.*', 'torch~=2.12']
+        no = ['torch==2.4.0', 'torch<2.11', 'torch>2.11', 'torch==2.10.*', 'torch~=2.12',
+              'torch~=2.0.0']
         for line in yes:
             self.assertTrue(es.satisfied_by(line, v), line)
         for line in no:
@@ -125,6 +127,104 @@ class Environment(unittest.TestCase):
             self.assertTrue(es.layered(f'{d}/v/bin/python'))
             subprocess.run([sys.executable, '-m', 'venv', '--without-pip', f'{d}/w'], check=True)
             self.assertFalse(es.layered(f'{d}/w/bin/python'))
+
+    def test_probe_redacts_credentials_in_index_urls(self):
+        def fake_run(cmd, **kwargs):
+            output = 'pip 24.1.2 from /site/pip (python 3.13)\n'
+            if len(cmd) > 2 and cmd[-1].startswith('import sys; print("%d.%d.%d"'):
+                output = '3.13.15\n'
+            return subprocess.CompletedProcess(cmd, 0, output, '')
+
+        with patch.dict('os.environ', {
+                'PIP_EXTRA_INDEX_URL': 'https://build-user:secret@packages.example/simple',
+                'UV_INDEX_URL': 'https://token:secret@mirror.example/simple'}), \
+                patch.dict(G, {'installed': lambda python: {}, 'run': fake_run,
+                               'in_venv': lambda python: False,
+                               'externally_managed': lambda python: False,
+                               'uv_path': lambda: None, 'gpus': lambda: [],
+                               'driver_cuda': lambda: None, 'online': lambda: False}):
+            values = es.probe()['pip_index']
+        self.assertEqual(values['PIP_EXTRA_INDEX_URL'],
+                         'https://<redacted>@packages.example/simple')
+        self.assertEqual(values['UV_INDEX_URL'], 'https://<redacted>@mirror.example/simple')
+        self.assertNotIn('secret', json.dumps(values))
+
+    def test_probe_handles_mig_memory_and_compute_na(self):
+        response = subprocess.CompletedProcess([], 0,
+                                              'NVIDIA MIG, [N/A], 580.0, [N/A]\n', '')
+        with patch.object(es.shutil, 'which', return_value='/usr/bin/nvidia-smi'), \
+                patch.dict(G, {'run': lambda *a, **k: response}):
+            cards = es.gpus()
+            capability = es.gpu_capability()
+        self.assertEqual(cards[0]['memory_mib'], None)
+        self.assertIsNone(cards[0]['compute_cap'])
+        self.assertIsNone(capability)
+
+    def test_summary_formats_uv_and_unknown_gpu_memory(self):
+        info = {
+            'torch': None, 'gpus': [{'name': 'NVIDIA MIG', 'memory_mib': None,
+                                     'compute_cap': None}],
+            'uv': 'uv 0.8.17', 'pip': '24.1.2', 'platform': 'colab',
+            'python': '3.13.15', 'executable': '/usr/bin/python3', 'venv': False,
+            'externally_managed': False, 'site_writable': True, 'user_site': None,
+            'online': False, 'driver_cuda': None, 'packages': {}, 'packages_total': 0,
+            'protected': {}, 'disk_free_gb': 1.0,
+        }
+        output = es.summary(info)
+        self.assertIn('uv 0.8.17', output)
+        self.assertNotIn('uv uv', output)
+        self.assertIn('NVIDIA MIG memory N/A', output)
+
+
+class WheelBuild(unittest.TestCase):
+    def test_fallback_wheel_tempdir_is_removed(self):
+        real_tempdir = es.tempfile.TemporaryDirectory
+        created = []
+
+        class TrackedTempDir:
+            def __init__(self, *args, **kwargs):
+                self.inner = real_tempdir(*args, **kwargs)
+                created.append(Path(self.inner.name))
+
+            def __enter__(self):
+                return self.inner.__enter__()
+
+            def __exit__(self, *args):
+                return self.inner.__exit__(*args)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == 'uv':
+                lock = Path(cmd[cmd.index('-o') + 1])
+                lock.write_text('purepkg==1.0\n')
+                return subprocess.CompletedProcess(cmd, 0, '', '')
+            if cmd[3] == 'download':
+                return subprocess.CompletedProcess(cmd, 1, '', 'no target wheel')
+            if cmd[3] == 'wheel':
+                out = Path(cmd[cmd.index('-w') + 1])
+                out.mkdir(parents=True, exist_ok=True)
+                (out / 'purepkg-1.0-py3-none-any.whl').write_bytes(b'wheel')
+                return subprocess.CompletedProcess(cmd, 0, '', '')
+            raise AssertionError(cmd)
+
+        with tempfile.TemporaryDirectory() as outer:
+            root = Path(outer)
+            envfile = root / 'env.json'
+            envfile.write_text(json.dumps({'all_packages': {}, 'python': '3.12.3',
+                                           'platform': 'kaggle',
+                                           'glibc': '2.35', 'machine': 'x86_64'}))
+            output = root / 'wheels'
+            args = SimpleNamespace(env=str(envfile), output=str(output), skip=[],
+                                   requirement=[], packages=['purepkg'])
+            with patch.object(es.tempfile, 'TemporaryDirectory', TrackedTempDir), \
+                    patch.dict(G, {'uv_path': lambda: 'uv', 'run': fake_run,
+                                   'platform_flags': lambda *a: []}):
+                with contextlib.redirect_stdout(io.StringIO()) as output_text:
+                    code = es.cmd_wheels(args)
+        self.assertEqual(code, 0)
+        self.assertEqual((output / 'purepkg-1.0-py3-none-any.whl').read_bytes(), b'wheel')
+        self.assertTrue(created)
+        self.assertTrue(all(not path.exists() for path in created))
+        self.assertIn('no immutable image digest', output_text.getvalue())
 
 
 if __name__ == '__main__':

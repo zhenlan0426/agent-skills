@@ -24,14 +24,16 @@ def _options(parser):
     parser.add_argument('--system')
     parser.add_argument('--schema', type=Path, help='JSON Schema file; validated locally')
     parser.add_argument('--schema-mode', choices=['prompt', 'native'], default='prompt')
-    parser.add_argument('--max-tokens', type=int)
+    parser.add_argument('--max-tokens', type=int, help=f'Omitted by default locally; --remote default '
+                        f'{remote.DEFAULT_MAX_TOKENS}')
     parser.add_argument('--temperature', type=float, help='Omitted by default; support varies by model')
     parser.add_argument('--reasoning', choices=['none', 'minimal', 'low', 'medium', 'high'])
 
 
 def _remote_options(parser, *, batch):
     parser.add_argument('--max-cost', type=float, metavar='USD',
-                        help='Stop dispatching rows once the job has spent this much (remote only)')
+                        help=f'Stop dispatching rows once the job has spent this much (remote only; batch default '
+                             f'{remote.DEFAULT_MAX_COST_USD:g})')
     parser.add_argument('--concurrency', type=int, help=f'Parallel calls inside the Kaggle job, 1-16 (default {remote.DEFAULT_CONCURRENCY})')
     parser.add_argument('--detach', action='store_true', help='Print {"job_id": ...} after the push and exit')
     parser.add_argument('--wait-timeout', type=float, metavar='SECONDS',
@@ -109,9 +111,10 @@ def _remote_batch(parser, args, schema):
     exact = isinstance(args.model, str) and '/' in args.model
     spec, dropped = remote.prepare_job(
         rows, catalog=None if exact else best.fetch_catalog(), system=args.system, schema=schema,
-        schema_mode=args.schema_mode, model=args.model, max_tokens=args.max_tokens,
+        schema_mode=args.schema_mode, model=args.model, max_tokens=args.max_tokens or remote.DEFAULT_MAX_TOKENS,
         temperature=args.temperature, reasoning=args.reasoning, concurrency=args.concurrency or remote.DEFAULT_CONCURRENCY,
-        max_cost_usd=args.max_cost, dedup=not args.no_dedup, execute_in=args.execute_in or 'creation')
+        max_cost_usd=remote.DEFAULT_MAX_COST_USD if args.max_cost is None else args.max_cost,
+        dedup=not args.no_dedup, execute_in=args.execute_in or 'creation')
     for row in dropped:
         print(json.dumps({'dropped_duplicate': row}), file=sys.stderr)
     store = remote.JobStore()

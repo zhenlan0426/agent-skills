@@ -285,6 +285,20 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('raw', rows[1])
         self.assertEqual((summary['rows_ok'], summary['rows_failed']), (2, 1))
 
+    def test_row_403_after_probe_is_retried(self):
+        # Live: the proxy answers 403 to calls over its in-flight spend budget (plan log).
+        call = FakeCall({(TOP, 'prompt 1'): [403, 403], (TOP, 'prompt 2'): 403})
+        _, lines = self.run_job(make_spec(2, candidates=[TOP]), call)
+        rows = {row['line']: row for row in self.kind(lines, 'row')}
+        self.assertEqual((rows[1]['ok'], rows[1]['attempts']), (True, 3))
+        self.assertEqual((rows[2]['ok'], rows[2]['status'], rows[2]['attempts']), (False, 403, 3))
+
+    def test_probe_403_moves_on_without_retrying(self):
+        call = FakeCall({TOP: 403})
+        _, lines = self.run_job(make_spec(1), call)
+        self.assertEqual(self.kind(lines, 'job')[0]['model'], OPUS)
+        self.assertEqual(self.time.sleeps, [])
+
     def test_every_row_written_exactly_once_under_concurrency(self):
         _, lines = self.run_job(make_spec(50, concurrency=8), FakeCall())
         self.assertEqual(sorted(row['line'] for row in self.kind(lines, 'row')), list(range(1, 51)))
@@ -453,6 +467,14 @@ class PrepareJobTests(unittest.TestCase):
                          (1, 'creation', 8, 4))
         self.assertIsNone(spec['dry_run'])
         self.assertEqual(len(spec['job_id']), 12)
+
+    def test_remote_defaults_cap_tokens_and_cost(self):
+        # Live: uncapped calls exhaust the proxy's in-flight budget one call at a time (plan log).
+        spec, _ = remote.prepare_job(self.ROWS, catalog=self.CATALOG)
+        self.assertEqual(spec['options'], {'max_tokens': remote.DEFAULT_MAX_TOKENS})
+        self.assertEqual(spec['max_cost_usd'], remote.DEFAULT_MAX_COST_USD)
+        spec, _ = remote.prepare_job(self.ROWS, catalog=self.CATALOG, max_tokens=None, max_cost_usd=None)
+        self.assertEqual((spec['options'], spec['max_cost_usd']), ({}, None))
 
     def test_dedup_can_be_disabled(self):
         spec, dropped = remote.prepare_job(self.ROWS, catalog=self.CATALOG, dedup=False)
@@ -731,6 +753,16 @@ class CliRemoteTests(unittest.TestCase):
         summaries = [row for row in self.json_lines(err) if 'job_id' in row]
         self.assertEqual(summaries[-1]['dropped_duplicates'], 1)
         self.assertEqual(summaries[-1]['model'], TOP)
+
+    def test_batch_remote_default_caps(self):
+        path = self.input_file([{'prompt': 'only prompt'}])
+        code, out, _ = self.cli('batch', path, '--remote', '--detach')
+        spec = remote.JobStore().spec(json.loads(out)['job_id'])
+        self.assertEqual((spec['options'], spec['max_cost_usd']),
+                         ({'max_tokens': remote.DEFAULT_MAX_TOKENS}, remote.DEFAULT_MAX_COST_USD))
+        code, out, _ = self.cli('batch', path, '--remote', '--detach', '--max-tokens', '300', '--max-cost', '0.5')
+        spec = remote.JobStore().spec(json.loads(out)['job_id'])
+        self.assertEqual((spec['options'], spec['max_cost_usd']), ({'max_tokens': 300}, 0.5))
 
     def test_detach_status_collect(self):
         path = self.input_file([{'id': 'a', 'prompt': 'only prompt'}])

@@ -32,6 +32,11 @@ shell, incremental file push, or Colab-style `up`/`down` in this workflow.
 
 ## Workflow
 
+`--run-timeout` is Kaggle's remote runtime limit, and defaults to 3600 seconds.
+Raise it above the expected run time for long jobs; for a job that may use the
+full T4 window, pass `--run-timeout 43200` (about 12 hours). Otherwise Kaggle
+can stop the job at the default one-hour limit.
+
 ```bash
 # All options precede --. The command is an argv, not an implicit shell string.
 kgpu prepare ./kaggle-job --project ./myproj --owner KAGGLE_USERNAME \
@@ -62,22 +67,25 @@ Use a private dataset and small bootstrap for larger projects, as described in
 the command must be an executable batch entrypoint; a notebook is not executed
 just because it is bundled.
 
-For `NvidiaTeslaT4`, `prepare` now selects the explicit image used by the
-working `aas-capture` submitter:
-`gcr.io/kaggle-private-byod/python@sha256:57e612b484cf3df5026ee4dcc3cb176974b22b2bc0937fb1e16132a8be4cb13c`.
-A matched 2026-09-27 smoke pair reached the wrapper in 4.1 seconds with this
-image and 711.8 seconds with Kaggle's default image, with no API runtime timeout
-in either request. The paired result supports the pin as a startup-delay
-mitigation; it does not guarantee Kaggle will never queue a kernel. Pass
-`--docker-image DIGEST` to select another Kaggle-provided image, or
-`--use-kaggle-default-image` to leave the image unset. Other accelerator shapes
-continue to use Kaggle's default image unless one is specified.
+For `NvidiaTeslaT4`, `prepare` pins the latest Kaggle Python image observed on
+2026-09-27:
+`gcr.io/kaggle-images/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461`.
+This is an immutable snapshot. Update the pin only after measuring a newer
+image with `--setup`. Pass `--docker-image DIGEST` to choose another
+Kaggle-provided image, or `--use-kaggle-default-image` to follow the current
+default for scoring-environment parity. Other accelerator shapes use Kaggle's
+default image unless one is specified.
 
-`--setup 'ARGS'` runs `envsetup install ARGS` in the kernel before the command
-(fingerprint saved as `out/env.json`, install report as `out/envsetup.json`); a
-failed install fails the job without running the command. It needs `--internet`
-or `--wheels` pointing at an attached dataset. See
-[environments.md](environments.md).
+`--setup 'ARGS'` probes the selected image, then runs `envsetup install ARGS`
+before the command (fingerprint saved as `out/env.json`, install report as
+`out/envsetup.json`); a failed probe or install fails the job without running
+the command. The fingerprint records the selected image digest in
+`kaggle_docker_image`. Build offline wheels from an `env.json` produced by the
+same image digest selected for `prepare` (the pinned T4 default or an explicit
+`--docker-image`); Python, glibc, and the CUDA torch build can differ across
+images. Do not reuse an old `out/env.json` after changing the image. Setup
+needs `--internet` or `--wheels` pointing at an attached dataset.
+See [environments.md](environments.md).
 
 Inside the job, the project is `/kaggle/working/project` and is the working
 directory. Attached inputs are under read-only `/kaggle/input`; inspect the
@@ -131,5 +139,6 @@ arrange authorized external checkpoint uploads or divide work into completed
 versions that consume prior outputs. Do not claim live file downloads or
 checkpoint recovery have been verified when only final output retrieval was.
 
-See [kaggle-cli-notes.md](kaggle-cli-notes.md) for upstream sources,
-version-specific caveats, and the validation record.
+See [kaggle-cli-notes.md](kaggle-cli-notes.md) for short CLI caveats and
+[the investigation log](../docs/kaggle-cli-investigation.md) for detailed
+measurements.
