@@ -117,9 +117,17 @@ about 15:46 started immediately, and both completed.
 - `get_kernel_session_status` returned QUEUED with an empty `failure_message`.
 - Quota was not the cause. GPU use was about 4 minutes of 45 hours. TPU use was
   0, so no hidden accelerator session was running.
-- Cause not established. Candidates: the account's GPU batch slot was blocked,
-  with the second job queued behind the first; or API-pushed versions are
-  scheduled differently from UI saves. Neither is proven.
+- It recurred with nothing ahead of it. `...160002-df55fe833c` (16:00, internet
+  on, `--setup`) started within a minute and completed. The next push,
+  `...160253-c183007b81` (16:02, internet off, one private dataset), was still
+  QUEUED after 15 minutes. Quota over that window grew only by the first run's
+  minute, and TPU use stayed 0.
+- Of five CLI pushes, two ran and three stalled. Internet on or off, attached
+  datasets, runtime cap and source size do not separate the two groups. Every
+  stalled push ran at once when re-saved from the UI.
+- Cause not established. Candidates: Kaggle's scheduler does not retry
+  API-pushed runs once they are queued, or API pushes are scheduled differently
+  from UI saves. Neither is proven.
 - The kagglesdk `KernelsApiClient` has `cancel_kernel_session`, but it has not
   been exercised. Until it is, cancel stuck runs in the UI.
 

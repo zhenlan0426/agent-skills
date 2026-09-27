@@ -32,11 +32,11 @@ installing anything, when:
 
 | | Local 4090 | Colab (G4 measured) | Kaggle T4 ×2 |
 |---|---|---|---|
-| Python | 3.12.3, system, externally managed | 3.13.15, `/usr`, root | _pending_ |
-| torch | 2.11.0 (PyPI, CUDA 13.0) in `~/.local` | 2.11.0+cu128 | _pending_ |
-| driver CUDA | 13.0 | 13.0 | _pending_ |
-| installer | uv 0.12.7, pip 25.2 | uv 0.12.9 (`UV_SYSTEM_PYTHON=true`), pip 24.1.2 | _pending_ |
-| preinstalled | 574 dists, incl. transformers, peft, trl, vllm, flash-attn | 705 dists, incl. transformers 5.16, peft, accelerate, jax, tensorflow; no trl, bitsandbytes | _pending_ |
+| Python | 3.12.3, system, externally managed | 3.13.15, `/usr`, root | 3.12.13, `/usr`, root |
+| torch | 2.11.0 (PyPI, CUDA 13.0) in `~/.local` | 2.11.0+cu128 | 2.10.0+cu128 |
+| driver CUDA | 13.0 | 13.0 | 13.0 (driver 580) |
+| installer | uv 0.12.7, pip 25.2 | uv 0.12.9 (`UV_SYSTEM_PYTHON=true`), pip 24.1.2 | uv 0.11.13 (`UV_SYSTEM_PYTHON=true`), pip 24.1.2 |
+| preinstalled | 574 dists, incl. transformers, peft, trl, vllm, flash-attn | 705 dists, incl. transformers 5.16, peft, accelerate, jax, tensorflow; no trl, bitsandbytes | 933 dists, incl. transformers 5.0, peft, accelerate, datasets, jax, tensorflow; no trl, bitsandbytes, vllm |
 | internet | yes | yes | only with `--internet` |
 | how to run | `envsetup install --venv .venv -r req.txt` | `cgpu setup S -- -r /content/p/req.txt` | `kgpu prepare ... --setup '-r req.txt'` |
 
@@ -74,7 +74,20 @@ trl`) installed in 4 s with uv: only bitsandbytes and trl were missing.
 
 ### Kaggle
 
-_pending live results_
+The image matches Colab's layout: system Python with uv and PyTorch's cu128
+torch, both one release behind Colab. Measured on a T4 ×2 kernel with
+`--internet`:
+
+- The LoRA set installed in 1 s with uv. Only bitsandbytes 0.50.2 and trl
+  1.14.0 were missing, and a second run was a no-op. A CUDA matmul importing
+  all of them passed afterwards.
+- An unpinned `pip install --dry-run vllm` resolved vllm 0.30 with **torch
+  2.13, torchvision 0.28, torchaudio 2.11 and triton 3.7.1**, replacing the
+  image's stack. With `install`'s pins it chose vllm 0.19.1 on the existing
+  torch 2.10, a release older than Colab got (0.26). It still upgraded
+  transformers 5.0 → 5.17, tokenizers and safetensors, and downgraded
+  setuptools 81 → 80.10.
+- `torch==2.4.0` and `flash-attn` were refused before anything ran (sm75).
 
 Without `--internet` nothing can be downloaded. Build the wheel set on this
 machine from the target's fingerprint, upload it as a private dataset, and
