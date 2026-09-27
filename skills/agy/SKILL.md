@@ -78,7 +78,14 @@ anything a script will consume — it turns the call into a typed function.
   input makes the agent reach for tools instead of just answering.
 - **Headless mode auto-denies tool use.** That is a feature: it doubles as
   prompt-injection protection when the input text is untrusted.
-- `--print-timeout` defaults to 5m; raise it for long jobs.
+- **Check `structured_output`, not `status`.** When the model tries a tool
+  (e.g. running its own code to test it), headless mode denies it and the call
+  can end with `status: SUCCESS`, exit 0, and `structured_output` null; the
+  reason goes to stderr. Treat a null `structured_output` as a failed row and
+  retry. Seen reproducibly on `gemini-3.8-flash-high` for a code-writing prompt
+  (2026-09-27).
+- `--print-timeout` defaults to 0 (no limit); set one (e.g. `15m`) so a
+  runaway agent loop cannot hang a batch.
 
 ## Other flags worth knowing
 
