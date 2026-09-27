@@ -97,7 +97,17 @@ are reported, not built.
 
 ## flash-attn
 
-_pending G4 build measurement_
+PyPI ships flash-attn only as an sdist, so installing it by name compiles CUDA
+code on the target. Measured on Colab G4 (48 vCPU, torch 2.11+cu128, Python
+3.13): under uv's build isolation it fails in a second (flash-attn doesn't
+declare torch as a build dependency); with `pip install --no-build-isolation`
+and `MAX_JOBS=40` it was still compiling at 25 minutes when the VM was lost
+(cause unconfirmed; RAM exhaustion from 40 nvcc jobs is plausible). So
+`install` refuses a by-name flash-attn that isn't already installed. Use
+`--skip flash-attn` with `attn_implementation="sdpa"`, or point the
+requirement at a prebuilt wheel for that exact torch/CUDA/Python
+(`flash-attn @ https://.../flash_attn-...whl`). The local 4090 already has
+2.8.3.post1. Below sm80 (T4) it is refused regardless.
 
 ## Changing envsetup
 
