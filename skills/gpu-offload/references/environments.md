@@ -46,6 +46,8 @@ Measured 2026-09-27; images change. The Kaggle column is from a private
 Kaggle Python default observed when this snapshot was pinned. `probe` prints
 current values, and `cgpu setup` / `kgpu --setup` run it on every use (Kaggle
 saves it as `out/env.json` and stamps `kaggle_docker_image`).
+Fingerprints omit installer environment variables because their values can
+contain credentials, including in URL paths and query strings.
 
 ### Local
 
@@ -53,7 +55,9 @@ Packages live in the user site (`~/.local/lib/python3.12/site-packages`), which
 every project shares; the base interpreter is externally managed. So `install`
 refuses to touch it unless given `--system`, and the normal form is
 `--venv .venv`: a venv created with `--system-site-packages`, which inherits the
-4090's torch stack and holds only the project's extras.
+4090's torch stack and holds only the project's extras. An existing venv must
+have `include-system-site-packages = true` in `pyvenv.cfg`; otherwise setup
+refuses it. Use a new venv path to create one with inheritance enabled.
 
 In such a layered venv `install` uses pip even though uv is present. uv only
 sees the venv's own packages: measured, `uv pip install 'torch>=2.3' peft` into
@@ -123,7 +127,10 @@ versions the target already has, and downloads only what differs. It
 resolves torch against PyTorch's own index (`--torch-backend cu128`) because
 PyPI's torch of the same version is a different build with different
 `nvidia-*` dependencies. Packages with native code and no wheel for the target
-are reported, not built.
+are reported, not built. Direct URL, VCS, editable, and local sources in the
+resolved lock are refused explicitly. Use index releases or prepare those
+wheels separately and replace direct requirements with package versions for
+the offline install.
 
 ## flash-attn
 

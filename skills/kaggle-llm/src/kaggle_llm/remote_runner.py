@@ -8,6 +8,7 @@ values, the proxy URL, or upstream error bodies to its output.
 import http.client
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -73,6 +74,26 @@ def _cost_usd(raw):
     if not isinstance(cost, dict):
         return 0.0
     return sum(v for v in cost.values() if isinstance(v, (int, float)) and not isinstance(v, bool)) / 1e9
+
+
+def _probe_error(raw):
+    """Match client.finish's text checks; this runner is embedded without package imports."""
+    try:
+        choice = raw["choices"][0]
+        message = choice["message"]
+        reason = choice.get("finish_reason")
+        if message.get("refusal") or reason == "content_filter":
+            return "Model refused or filtered the request."
+        if reason == "length":
+            return "Output was truncated; increase max_tokens before retrying."
+        text = message.get("content")
+        if isinstance(text, str):
+            text = re.sub(r"^\s*<think>.*?</think>\s*", "", text, count=1, flags=re.S)
+        if not isinstance(text, str) or not text.strip():
+            return "Model returned no text content."
+    except (TypeError, KeyError, IndexError, AttributeError):
+        return "Malformed completion response."
+    return None
 
 
 def run_job(spec, call, out_path, *, environ=os.environ, sleep=time.sleep, clock=time.monotonic):
@@ -145,6 +166,9 @@ def run_job(spec, call, out_path, *, environ=os.environ, sleep=time.sleep, clock
         model, probe = None, []
         for candidate in candidates:
             raw, error, _ = attempt_call(candidate, {"messages": PROBE_MESSAGES, "max_tokens": PROBE_MAX_TOKENS})
+            if error is None and (reason := _probe_error(raw)):
+                probe.append({"model": candidate, "status": 200, "error": reason})
+                continue
             probe.append({"model": candidate, "status": 200 if error is None else error.status})
             if error is None:
                 model = candidate

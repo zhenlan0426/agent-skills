@@ -115,6 +115,7 @@ def forget_if(credentials, model):
 def select(client, *, refresh=False):
     """Return the cached pick, or probe ranked candidates and cache the first that answers."""
     from .auth import KaggleLLMError
+    from .client import finish
 
     if not refresh and (cached := read_cache(client.credentials)):
         return cached
@@ -125,12 +126,17 @@ def select(client, *, refresh=False):
     unavailable = []
     for model in candidates:
         try:
-            client.chat(PROBE_MESSAGES, model=model, max_tokens=256)
+            raw = client.chat(PROBE_MESSAGES, model=model, max_tokens=256)
         except KaggleLLMError as exc:
             if exc.status in UNAVAILABLE:
                 unavailable.append(model)
                 continue
             raise
+        try:
+            finish(raw, None)
+        except KaggleLLMError:
+            unavailable.append(model)
+            continue
         result = {
             "model": model,
             "selected_at": datetime.now(timezone.utc).isoformat(),

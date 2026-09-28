@@ -155,11 +155,6 @@ def online():
     return False
 
 
-def redact_url_credentials(value):
-    """Remove URL user-info while retaining the index host/path for debugging."""
-    return re.sub(r'(?i)(https?://)[^/@\s]+@', r'\1<redacted>@', value)
-
-
 def uv_path():
     path = shutil.which('uv')
     if path:
@@ -199,8 +194,8 @@ def probe(python=sys.executable):
         'user_site': usersite if usersite and Path(usersite).is_dir() else None,
         'pip': pip.stdout.split()[1] if pip.returncode == 0 else None,
         'uv': run([uv, '--version']).stdout.strip() if uv else None,
-        'pip_index': {k: redact_url_credentials(v) for k, v in os.environ.items()
-                      if k.startswith(('PIP_', 'UV_')) and 'TOKEN' not in k and 'PASSWORD' not in k},
+        # Installer environment values can contain credentials in URLs, paths,
+        # queries, or arbitrary variables. Do not persist them in artifacts.
         'gpus': gpus(),
         'driver_cuda': driver_cuda(),
         'nvcc': bool(shutil.which('nvcc')),
@@ -325,6 +320,18 @@ def ensure_venv(path):
     path = Path(path).resolve()
     python = path / 'bin' / 'python'
     if python.exists():
+        cfg = path / 'pyvenv.cfg'
+        try:
+            config = dict(line.split('=', 1) for line in cfg.read_text().splitlines()
+                          if '=' in line)
+            inherits = {k.strip(): v.strip().lower() for k, v in config.items()}.get(
+                'include-system-site-packages') == 'true'
+        except OSError:
+            inherits = False
+        if not inherits or not in_venv(str(python)):
+            raise ValueError(f'refusing {path}: --venv requires a venv with '
+                             'include-system-site-packages = true in pyvenv.cfg. '
+                             'Use a new --venv path to inherit the preinstalled CUDA stack.')
         return str(python)
     say(f'creating {path} (inherits system site-packages)')
     uv = uv_path()
@@ -337,7 +344,11 @@ def ensure_venv(path):
 
 
 def cmd_install(a):
-    python = ensure_venv(a.venv) if a.venv else sys.executable
+    try:
+        python = ensure_venv(a.venv) if a.venv else sys.executable
+    except ValueError as e:
+        say(str(e))
+        return 2
     reqs = []
     for f in a.requirement:
         reqs += read_requirements(f)
@@ -578,10 +589,19 @@ def cmd_wheels(a):
             say('could not resolve for the target')
             return 1
         resolved = {}
-        for line in lock.read_text().splitlines():
-            m = re.match(r'^([A-Za-z0-9._-]+)==([^\s;]+)', line)
-            if m:
-                resolved[norm(m[1])] = m[2]
+        for lineno, line in enumerate(lock.read_text().splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            m = re.fullmatch(r'([A-Za-z0-9._-]+)==([^\s;]+)(?:\s*;.*)?', line)
+            if not m:
+                # Do not echo the line: direct sources may contain tokens.
+                say(f'unsupported resolved requirement on lock line {lineno}: '
+                    'offline wheels requires name==version entries. Direct URLs, '
+                    'VCS, editable, and local sources are not supported; use an '
+                    'index release or prepare their wheels separately.')
+                return 2
+            resolved[norm(m[1])] = m[2]
     need = {k: v for k, v in resolved.items() if have.get(k, '').split('+')[0] != v.split('+')[0]}
     if not need:
         say('the target already has everything these requirements resolve to')

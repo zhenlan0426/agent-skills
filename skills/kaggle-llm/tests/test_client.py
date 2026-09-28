@@ -498,6 +498,35 @@ class ClientTests(unittest.TestCase):
             c.prompt('hello')
         self.assertIsNone(best.read_cache(c.credentials))
 
+    def test_selection_skips_unusable_completions_before_caching(self):
+        top, next_model = 'anthropic/claude-opus-5@default', 'anthropic/claude-sonnet-5@default'
+        invalid = [completion(''), completion('  '), completion(None),
+                   completion('<think>reasoning only</think>'),
+                   completion(choices=[{'message': {'content': 'OK'}, 'finish_reason': 'length'}]),
+                   completion(choices=[{'message': {'content': 'OK', 'refusal': 'refused'}}]),
+                   completion(choices=[{'message': {'content': 'OK'}, 'finish_reason': 'content_filter'}]),
+                   completion(choices=[None])]
+        for response in invalid:
+            with self.subTest(response=response.json()):
+                self.requests.clear()
+                c = self.client(lambda r: response if json.loads(r.content)['model'] == top else completion())
+                with patch('kaggle_llm.best.fetch_catalog', return_value=[top, next_model]):
+                    self.assertEqual(c.best_model(refresh=True), next_model)
+                cached = best.read_cache(c.credentials)
+                self.assertEqual(cached['unavailable'], [top])
+                self.assertEqual(cached['untried'], [])
+                self.assertEqual(c.prompt('hello')['text'], 'hello')
+                self.assertEqual([json.loads(r.content)['model'] for r in self.requests],
+                                 [top, next_model, next_model])
+
+    def test_empty_probe_never_creates_cache(self):
+        c = self.client(lambda r: completion(''))
+        best.cache_path(c.credentials).unlink()
+        with patch('kaggle_llm.best.fetch_catalog', return_value=['anthropic/claude-opus-5@default']), \
+                self.assertRaisesRegex(KaggleLLMError, 'No Claude'):
+            c.best_model()
+        self.assertFalse(best.cache_path(c.credentials).exists())
+
     def test_cli_batch_pins_one_model(self):
         c = self.client(lambda r: completion())
         with patch.object(c, 'best_model', return_value='google/test') as pick:

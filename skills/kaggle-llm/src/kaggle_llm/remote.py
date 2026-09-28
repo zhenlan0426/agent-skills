@@ -55,7 +55,7 @@ class TaskInfo(NamedTuple):
     version: int
     state: str               # "pending" | "completed" | "errored"
     error: Optional[str]
-    is_public: bool
+    is_public: Optional[bool]  # None when visibility is unknown; either True means public
 
 
 class RunInfo(NamedTuple):
@@ -253,11 +253,19 @@ def submit(store, backend, job_id, *, slug=SLUG):
         version = backend.push(slug, source)
         state.update(status="submitted", version=version, known_runs=known_runs, submitted_at=_now())
         store.save_state(job_id, state)
-    info = backend.task(slug)
-    if info is None or info.is_public is not False:
-        _fail(store, job_id, state, "task is not verifiably private")
+    try:
+        info = backend.task(slug)
+        privacy_error = None if info is not None and info.is_public is False else "task is not verifiably private"
+    except KaggleLLMError as exc:
+        privacy_error = f"task privacy lookup failed: {exc}"
+    if privacy_error:
+        # The push already happened. Keep its version and runs collectable so
+        # recovery cannot accidentally replay prompts that ran successfully.
+        state["privacy_error"] = privacy_error
+        store.save_state(job_id, state)
         raise KaggleLLMError(f"Kaggle task {slug} is public or its visibility could not be verified; "
-                             "prompts and results may be exposed. Check it on kaggle.com now.")
+                             "prompts and results may be exposed. Check it on kaggle.com now. "
+                             f"Job {job_id} was submitted; collect it with: kaggle-llm remote collect {job_id}")
 
 
 def _same_model(run_model, model):
@@ -310,6 +318,12 @@ def wait(store, backend, job_id, *, timeout=3600, interval=10, sleep=None, clock
     sleep = sleep or time.sleep
     clock = clock or time.monotonic
     state = store.load_state(job_id)
+    # Recover records written by versions that marked a post-push privacy
+    # failure terminal even though the job was already running on Kaggle.
+    if (state["status"] == "failed" and state.get("version") is not None
+            and state.get("error") == "task is not verifiably private"):
+        state.update(status="submitted", privacy_error=state.pop("error"))
+        store.save_state(job_id, state)
     if state["status"] == "downloaded":
         return state
     if state["status"] not in ("submitted", "running"):
@@ -432,6 +446,8 @@ def summary(store, job_id):
               "dropped_duplicates": len(store.dropped(job_id)), "stopped_reason": None}
     if state.get("error"):
         result["error"] = state["error"]
+    if state.get("privacy_error"):
+        result["privacy_error"] = state["privacy_error"]
     if state["status"] == "downloaded":
         rows, meta = _own_rows(store, job_id)
         ok = sum(row["ok"] for row in rows)
@@ -507,7 +523,12 @@ class SdkBackend:
             if exc.status == 404:
                 return None
             raise
-        is_public = bool(info.is_public) or bool(getattr(info, "is_backing_notebook_published", False))
+        # SDK getters return False for absent optional booleans. Its presence
+        # API distinguishes explicitly private from unknown visibility.
+        visibility = [getattr(info, field) if field in info else None
+                      for field in ("is_public", "is_backing_notebook_published")]
+        is_public = (True if any(value is True for value in visibility) else
+                     False if all(value is False for value in visibility) else None)
         return TaskInfo(info.slug.version_number, _state(info.creation_state),
                         info.creation_error_message or info.error or None, is_public)
 

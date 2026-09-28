@@ -44,7 +44,7 @@ and fp16 can overflow on models built for bf16).
    decision, "fits locally" means it runs on one 24GB card in bf16 with
    FlashAttention 2. Include standard techniques that do not change the
    computation: smaller micro-batches with gradient accumulation, gradient
-   checkpointing, 8-bit optimizer states, or CPU offload into 94GB of RAM.
+   checkpointing, or CPU offload into 94GB of RAM.
 3. **Fits locally but the 4090 is occupied**, or the user wants parallel work:
    use **Kaggle only if** the job can be split across two separate 16GB T4s,
    runs correctly in fp16 without FlashAttention 2, and is expected to finish
@@ -63,7 +63,8 @@ parity matters, and check the competition's code requirements before choosing
 a shape.
 
 When the only way to fit locally changes the method or results (QLoRA instead
-of bf16 LoRA, 4-bit instead of bf16 weights, a shorter context), that
+of bf16 LoRA, 4-bit instead of bf16 weights, 8-bit optimizer states that change
+optimizer arithmetic, or a shorter context), that
 trade-off belongs to the user. Present both options with their costs, for
 example "QLoRA locally, or bf16 LoRA on G4 for about 3h ≈ 27 CU".
 

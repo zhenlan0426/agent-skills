@@ -13,10 +13,10 @@ import threading
 import types
 import unittest
 import urllib.error
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 
@@ -275,6 +275,32 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.kind(lines, 'row'), [])
         self.assertEqual(lines[-1]['stopped_reason'], 'no_model')
 
+    def test_probe_requires_usable_text_like_local_prompt(self):
+        refused = completion('OK')
+        refused['choices'][0]['message']['refusal'] = 'refused'
+        invalid = [completion(''), completion('  '), completion(None), completion([]),
+                   completion('<think>reasoning only</think>'),
+                   completion('OK', finish_reason='length'),
+                   completion('OK', finish_reason='content_filter'), refused,
+                   {}, {'choices': []}, {'choices': [None]}]
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                self.out.unlink(missing_ok=True)
+                with self.assertRaises(KaggleLLMError) as caught:
+                    finish(raw, None)
+                call = FakeCall({TOP: raw})
+                _, lines = self.run_job(make_spec(1), call)
+                job = self.kind(lines, 'job')[0]
+                self.assertEqual(job['model'], OPUS)
+                self.assertEqual(job['probe'][0]['error'], str(caught.exception))
+                self.assertEqual([model for model, _, _ in call.calls], [TOP, OPUS, OPUS])
+
+    def test_only_empty_probe_stops_without_sending_rows(self):
+        _, lines = self.run_job(make_spec(candidates=[TOP]), FakeCall({TOP: completion('')}))
+        self.assertIsNone(self.kind(lines, 'job')[0]['model'])
+        self.assertEqual(self.kind(lines, 'row'), [])
+        self.assertEqual(lines[-1]['stopped_reason'], 'no_model')
+
     def test_row_retries_only_transient_failures(self):
         call = FakeCall({(TOP, 'prompt 2'): 400, (TOP, 'prompt 3'): [500], (TOP, 'prompt 1'): ['timeout']})
         summary, lines = self.run_job(make_spec(), call)
@@ -513,6 +539,30 @@ class PrepareJobTests(unittest.TestCase):
 
 # Phase 3 ---------------------------------------------------------------------
 
+class SdkPrivacyTests(unittest.TestCase):
+    def test_optional_visibility_fields_must_be_explicitly_false(self):
+        from kagglesdk.benchmarks.types.benchmark_tasks_api_service import ApiBenchmarkTask
+
+        for public in (None, False, True):
+            for published in (None, False, True):
+                with self.subTest(public=public, published=published):
+                    data = {'slug': {'taskSlug': remote.SLUG, 'versionNumber': 1}}
+                    if public is not None:
+                        data['isPublic'] = public
+                    if published is not None:
+                        data['isBackingNotebookPublished'] = published
+                    response = ApiBenchmarkTask.from_dict(data)
+                    backend = remote.SdkBackend.__new__(remote.SdkBackend)
+                    backend.api = Mock()
+                    backend.api._make_task_slug.return_value = response.slug
+                    client = Mock()
+                    client.benchmarks.benchmark_tasks_api_client.get_benchmark_task.return_value = response
+                    backend._client = lambda action: nullcontext(client)
+                    info = backend.task(remote.SLUG)
+                    expected = (True if public is True or published is True else
+                                False if public is False and published is False else None)
+                    self.assertIs(info.is_public, expected)
+
 class FakeBackend:
     """In-memory Kaggle. Each poll (task/runs) advances a pending creation by one
     step. When creation completes, its run completes; downloading a run executes
@@ -636,7 +686,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(self.store.load_state(job_id)['status'], 'failed')
         self.assertEqual(backend.sources, {})  # Refused before any prompt reached Kaggle.
 
-    def test_task_public_after_push_is_fatal(self):
+    def test_task_public_after_push_raises_but_remains_collectable(self):
         backend, job_id = FakeBackend(), self.job()
         push = backend.push
 
@@ -647,7 +697,46 @@ class OrchestratorTests(unittest.TestCase):
         backend.push = push_then_publish
         with self.assertRaisesRegex(KaggleLLMError, 'public'):
             remote.submit(self.store, backend, job_id)
-        self.assertEqual(self.store.load_state(job_id)['status'], 'failed')
+        self.assertEqual(self.store.load_state(job_id)['status'], 'submitted')
+        self.assertIn('privacy_error', remote.summary(self.store, job_id))
+        self.assertEqual(self.wait(backend, job_id)['status'], 'downloaded')
+        self.assertEqual(len(remote.collect(self.store, job_id)), 3)
+        self.assertIn('privacy_error', remote.summary(self.store, job_id))
+
+    def test_unknown_visibility_refuses_push(self):
+        job_id, backend = self.job(), FakeBackend(public=None)
+        with self.assertRaisesRegex(KaggleLLMError, 'visibility'):
+            remote.submit(self.store, backend, job_id)
+        self.assertEqual(backend.sources, {})
+
+    def test_post_push_privacy_lookup_failure_can_collect_then_resume(self):
+        for outcome in (None, remote.TaskInfo(2, 'pending', None, None),
+                        KaggleLLMError('lookup unavailable', status=503)):
+            with self.subTest(outcome=outcome):
+                call = FakeCall({(TOP, 'second prompt about bananas'): 400})
+                backend, job_id = FakeBackend(call), self.job()
+                with patch.object(backend, 'task', side_effect=[backend.task(remote.SLUG), outcome]):
+                    with self.assertRaisesRegex(KaggleLLMError, f'remote collect {job_id}'):
+                        remote.submit(self.store, backend, job_id)
+                state = self.store.load_state(job_id)
+                self.assertEqual((state['status'], state['version'], state['known_runs']),
+                                 ('submitted', 2, [1]))
+                with self.assertRaisesRegex(KaggleLLMError, 'collect it before resuming'):
+                    remote.resume(self.store, job_id)
+                self.wait(backend, job_id)
+                child = remote.resume(self.store, job_id)
+                self.assertEqual([row['line'] for row in self.store.spec(child)['rows']], [2])
+                backend.call = FakeCall()
+                self.assertTrue(all(row['ok'] for row in self.run_job(backend, child)))
+
+    def test_legacy_post_push_privacy_failure_can_be_collected(self):
+        backend, job_id = FakeBackend(), self.job()
+        remote.submit(self.store, backend, job_id)
+        state = self.store.load_state(job_id)
+        state.update(status='failed', error='task is not verifiably private')
+        self.store.save_state(job_id, state)
+        self.assertEqual(self.wait(backend, job_id)['status'], 'downloaded')
+        self.assertTrue(all(row['ok'] for row in remote.collect(self.store, job_id)))
 
     def test_mismatched_job_id_in_results_fails(self):
         backend = FakeBackend()

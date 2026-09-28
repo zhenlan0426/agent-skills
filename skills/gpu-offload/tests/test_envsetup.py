@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for envsetup. No installs, no network; one venv is created."""
+"""Offline tests for envsetup. No installs or network; temporary venvs only."""
 import contextlib
 import io
 import json
@@ -125,10 +125,25 @@ class Environment(unittest.TestCase):
             subprocess.run([sys.executable, '-m', 'venv', '--without-pip',
                             '--system-site-packages', f'{d}/v'], check=True)
             self.assertTrue(es.layered(f'{d}/v/bin/python'))
+            self.assertEqual(es.ensure_venv(f'{d}/v'), f'{d}/v/bin/python')
             subprocess.run([sys.executable, '-m', 'venv', '--without-pip', f'{d}/w'], check=True)
             self.assertFalse(es.layered(f'{d}/w/bin/python'))
+            original = Path(d, 'w', 'pyvenv.cfg').read_text()
+            with patch.object(es.subprocess, 'run', side_effect=AssertionError('installer ran')), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                code = es.cmd_install(install_args(venv=f'{d}/w', packages=['peft']))
+            self.assertEqual(code, 2)
+            self.assertIn('include-system-site-packages = true', output.getvalue())
+            self.assertEqual(Path(d, 'w', 'pyvenv.cfg').read_text(), original)
 
-    def test_probe_redacts_credentials_in_index_urls(self):
+    def test_existing_python_without_venv_config_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, 'bin').mkdir()
+            Path(d, 'bin', 'python').symlink_to(sys.executable)
+            with self.assertRaisesRegex(ValueError, 'refusing'):
+                es.ensure_venv(d)
+
+    def test_probe_omits_installer_environment_secrets(self):
         def fake_run(cmd, **kwargs):
             output = 'pip 24.1.2 from /site/pip (python 3.13)\n'
             if len(cmd) > 2 and cmd[-1].startswith('import sys; print("%d.%d.%d"'):
@@ -136,18 +151,24 @@ class Environment(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, output, '')
 
         with patch.dict('os.environ', {
-                'PIP_EXTRA_INDEX_URL': 'https://build-user:secret@packages.example/simple',
-                'UV_INDEX_URL': 'https://token:secret@mirror.example/simple'}), \
+                'PIP_INDEX_URL': 'https://example.com/simple?token=query-secret',
+                'PIP_EXTRA_INDEX_URL': 'https://build-user:password-secret@packages.example/path-secret/simple',
+                'UV_INDEX_URL': 'https://mirror.example/simple#fragment-secret',
+                'UV_INDEX_PRIVATE_USERNAME': 'username-secret',
+                'PIP_ARBITRARY': 'arbitrary-secret'}), \
                 patch.dict(G, {'installed': lambda python: {}, 'run': fake_run,
                                'in_venv': lambda python: False,
                                'externally_managed': lambda python: False,
                                'uv_path': lambda: None, 'gpus': lambda: [],
-                               'driver_cuda': lambda: None, 'online': lambda: False}):
-            values = es.probe()['pip_index']
-        self.assertEqual(values['PIP_EXTRA_INDEX_URL'],
-                         'https://<redacted>@packages.example/simple')
-        self.assertEqual(values['UV_INDEX_URL'], 'https://<redacted>@mirror.example/simple')
-        self.assertNotIn('secret', json.dumps(values))
+                               'driver_cuda': lambda: None, 'online': lambda: False}), \
+                tempfile.TemporaryDirectory() as d, \
+                contextlib.redirect_stdout(io.StringIO()):
+            fingerprint = Path(d, 'env.json')
+            self.assertEqual(es.cmd_probe(SimpleNamespace(json=str(fingerprint))), 0)
+            saved = fingerprint.read_text()
+        self.assertNotIn('pip_index', json.loads(saved))
+        self.assertNotIn('secret', saved)
+        self.assertNotIn('example.com', saved)
 
     def test_probe_handles_mig_memory_and_compute_na(self):
         response = subprocess.CompletedProcess([], 0,
@@ -177,6 +198,33 @@ class Environment(unittest.TestCase):
 
 
 class WheelBuild(unittest.TestCase):
+    def test_unsupported_lock_entries_fail_before_download(self):
+        entries = ['directpkg @ https://example.com/pkg.whl?token=secret',
+                   'directpkg @ git+https://example.com/repo.git',
+                   'directpkg @ file:///tmp/pkg', '-e /tmp/pkg']
+        with tempfile.TemporaryDirectory() as d:
+            envfile = Path(d, 'env.json')
+            envfile.write_text(json.dumps({'all_packages': {'directpkg': '1.0'},
+                                           'python': '3.12.3'}))
+            args = SimpleNamespace(env=str(envfile), output=f'{d}/wheels', skip=[],
+                                   requirement=[], packages=['directpkg'])
+            for entry in entries:
+                with self.subTest(entry=entry):
+                    def fake_run(cmd, **kwargs):
+                        self.assertEqual(cmd[:3], ['uv', 'pip', 'compile'])
+                        Path(cmd[cmd.index('-o') + 1]).write_text(
+                            '# resolved\n\notherpkg==1.0\n' + entry + '\n')
+                        return subprocess.CompletedProcess(cmd, 0, '', '')
+
+                    with patch.dict(G, {'uv_path': lambda: 'uv', 'run': fake_run}), \
+                            contextlib.redirect_stdout(io.StringIO()) as output:
+                        code = es.cmd_wheels(args)
+                    self.assertEqual(code, 2)
+                    self.assertIn('Direct URLs', output.getvalue())
+                    self.assertNotIn('secret', output.getvalue())
+                    self.assertNotIn('already has everything', output.getvalue())
+                    self.assertEqual(list(Path(args.output).iterdir()), [])
+
     def test_fallback_wheel_tempdir_is_removed(self):
         real_tempdir = es.tempfile.TemporaryDirectory
         created = []
