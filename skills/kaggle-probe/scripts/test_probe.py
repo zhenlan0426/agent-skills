@@ -36,6 +36,24 @@ class ProbeTests(unittest.TestCase):
                     elapsed = Decimal(signal["target_seconds"]) + Decimal("42.1")
                     self.assertEqual(codec.observe(elapsed, signal["outcome"], "42.1", 1), digit)
 
+    def test_separate_allowance_keeps_grid_and_crash_slot(self):
+        legacy = Codec("8", "0.5", 5, 1)
+        self.assertEqual(Codec("8", "0.5", 5, 1, "0.5"), Codec(**{**legacy.__dict__, "allowance_hours": "0.5"}))
+        self.assertEqual((legacy.buckets, legacy.base, legacy.signal(47)["target_seconds"]), (16, 63, "1800.0"))
+        codec = Codec("8", "0.25", 2, 4, "0.5")
+        self.assertEqual((codec.buckets, codec.base), (31, 216))
+        self.assertEqual(codec.allowance_seconds, 1800)
+        for digit in range(codec.base):
+            signal = codec.signal(digit)
+            self.assertEqual(Decimal(signal["target_seconds"]), 1800 + signal["bucket"] * 900)
+            self.assertEqual(codec.observe(Decimal(signal["target_seconds"]) + 37, signal["outcome"], 37, 300), digit)
+        self.assertEqual(codec.signal(codec.base - 1)["target_seconds"], "28800.00")
+        with self.assertRaisesRegex(ValueError, "Reserved crash"):
+            codec.observe(1800 + 37, "exception", 37, 300)
+        for bad in (("8", "0.25", 1, 1, "0.3"), ("8", "0.25", 1, 1, "9"), ("8", "0.25", 1, 1, "0")):
+            with self.assertRaises(ValueError):
+                Codec(*bad)
+
     def test_fraction_bounds_and_endpoint(self):
         codec = Codec()
         for value in ("0", "0.000000001", "0.3333333333333333333333", "0.5", "0.999999999", "1"):

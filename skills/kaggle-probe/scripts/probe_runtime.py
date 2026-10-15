@@ -23,21 +23,34 @@ class Codec:
     resolution_hours: str = "0.5"
     digits: int = 5
     valid_outcomes: int = 1
+    # Computation allowance before the first deadline; None keeps it equal to one resolution step.
+    allowance_hours: str = None
 
     def __post_init__(self):
         total, step = decimal(self.total_hours), decimal(self.resolution_hours)
         if total <= 0 or step <= 0:
             raise ValueError("Time window and resolution must be positive")
-        ratio = total / step
-        if ratio != int(ratio) or ratio < 1:
-            raise ValueError("Time window must be an integer multiple of resolution")
+        allowance = self.allowance_seconds / 3600
+        if allowance <= 0 or allowance > total:
+            raise ValueError("Computation allowance must be positive and within the time window")
+        ratio = (total - allowance) / step
+        if ratio != int(ratio):
+            raise ValueError("Time window minus allowance must be an integer multiple of resolution")
         for value in (self.digits, self.valid_outcomes):
             if type(value) is not int or value < 1:
                 raise ValueError("digits and valid_outcomes must be positive integers")
 
     @property
     def buckets(self):
-        return int(decimal(self.total_hours) / decimal(self.resolution_hours))
+        return int((decimal(self.total_hours) * 3600 - self.allowance_seconds) / self.step_seconds) + 1
+
+    @property
+    def allowance_seconds(self):
+        hours = self.resolution_hours if self.allowance_hours is None else self.allowance_hours
+        return decimal(hours) * 3600
+
+    def target_seconds(self, bucket):
+        return self.allowance_seconds + bucket * self.step_seconds
 
     @property
     def step_seconds(self):
@@ -97,7 +110,7 @@ class Codec:
         outcome_index, bucket = divmod(digit + 1, self.buckets)
         outcome = ("exception", "missing", "format")[outcome_index] if outcome_index < 3 else f"valid:{outcome_index - 3}"
         return {"digit": digit, "bucket": bucket,
-                "target_seconds": str((bucket + 1) * self.step_seconds), "outcome": outcome}
+                "target_seconds": str(self.target_seconds(bucket)), "outcome": outcome}
 
     def observe(self, elapsed_seconds, outcome, overhead_seconds, tolerance_seconds):
         overhead, tolerance = decimal(overhead_seconds), decimal(tolerance_seconds)
@@ -106,7 +119,7 @@ class Codec:
         elapsed = decimal(elapsed_seconds)
         if elapsed < 0:
             raise ValueError("Elapsed time must be nonnegative")
-        corrected = elapsed - overhead - self.step_seconds
+        corrected = elapsed - overhead - self.allowance_seconds
         bucket = int((corrected / self.step_seconds).to_integral_value(rounding=ROUND_HALF_UP))
         if not 0 <= bucket < self.buckets:
             raise ValueError("Observed time is outside the configured buckets")
@@ -141,7 +154,7 @@ def emit_signal(codec, digit, is_toy, write_valid, write_invalid, submission_fil
     if outcome in ("format",) or outcome.startswith("valid:"):
         if not output.is_file():
             raise ValueError("Submission writer did not create the expected file")
-    if clock() - started_at >= float(codec.step_seconds):
+    if clock() - started_at >= float(codec.allowance_seconds):
         raise TimeoutError("Probe preparation exceeded the computation allowance")
     if ready is not None:
         ready()  # Disarm the computation watchdog only after output is ready.
@@ -178,7 +191,7 @@ def run_probe(codec, index, mode, adapter_source, submission_file, started_at):
         armed = False
 
     try:
-        remaining = started_at + float(codec.step_seconds) - time.monotonic()
+        remaining = started_at + float(codec.allowance_seconds) - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Runtime imports exceeded the computation allowance")
         signals.setitimer(signals.ITIMER_REAL, remaining)
@@ -193,7 +206,7 @@ def run_probe(codec, index, mode, adapter_source, submission_file, started_at):
         if armed:
             disarm()
             if not toy:
-                wait_until(started_at + float(codec.step_seconds))
+                wait_until(started_at + float(codec.allowance_seconds))
         raise
     finally:
         disarm()

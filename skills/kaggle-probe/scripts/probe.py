@@ -23,7 +23,7 @@ def prepare(args):
     # Kaggle derives the slug from the title, so the slug must already be in slugified form.
     if not re.fullmatch(r"[\w-]+/[a-z0-9]{2,}(-[a-z0-9]+)*", args.kernel):
         raise ValueError("Kernel must be owner/slug, with a lowercase hyphenated slug of 2+ characters")
-    codec = Codec(args.total_hours, args.resolution_hours, args.digits, args.valid_outcomes)
+    codec = Codec(args.total_hours, args.resolution_hours, args.digits, args.valid_outcomes, args.allowance_hours)
     if args.runtime_limit_hours is not None:
         limit = decimal(args.runtime_limit_hours)
         if limit <= 0 or decimal(codec.total_hours) > limit:
@@ -68,8 +68,8 @@ if __name__ == "__main__":
                 "codec": asdict(codec), "probes": probes}
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return {"manifest": str(root / "manifest.json"), "base": codec.base,
-            "capacity": codec.capacity, "computation_allowance_seconds": str(codec.step_seconds),
-            "max_target_seconds": str(codec.buckets * codec.step_seconds),
+            "capacity": codec.capacity, "computation_allowance_seconds": str(codec.allowance_seconds),
+            "buckets": codec.buckets, "max_target_seconds": str(codec.target_seconds(codec.buckets - 1)),
             "enable_gpu": False, "enable_internet": False,
             "submission_count": codec.digits}
 
@@ -112,6 +112,7 @@ def main():
     prep.add_argument("--total-hours", default="4")
     prep.add_argument("--runtime-limit-hours", help="Reject a configured window above this competition runtime cap")
     prep.add_argument("--resolution-hours", default="0.5")
+    prep.add_argument("--allowance-hours", help="Computation allowance before the first deadline (default: one resolution step)")
     prep.add_argument("--digits", type=int, default=5)
     prep.add_argument("--valid-outcomes", type=int, default=1)
     prep.add_argument("--submission-file", default="submission.csv")

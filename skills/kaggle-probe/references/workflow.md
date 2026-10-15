@@ -62,8 +62,8 @@ code should register exit handlers or background work that changes the outcome
 after the deadline.
 
 The monotonic clock starts at the beginning of the generated script, before
-runtime and adapter imports. All preparation must finish within the first
-`resolution_hours` interval. `run_probe` uses a Linux real-time alarm to bound
+runtime and adapter imports. All preparation must finish within the computation
+allowance (`allowance_hours`, default one `resolution_hours` step). `run_probe` uses a Linux real-time alarm to bound
 preparation and routes caught failures (including missing dependencies,
 out-of-range values, writer errors, and timeouts) to the reserved first exception
 slot. Toy failures exit immediately. Normal output is ready before waiting, so
@@ -90,17 +90,17 @@ The outcome channel order is fixed:
 
 For digit `d`, `channel, bucket = divmod(d + 1, K)`. The exception channel's
 bucket zero is reserved and is never emitted for data. Its deadline is one
-resolution interval after startup; earlier unhandled startup errors are also
+allowance after startup; earlier unhandled startup errors are also
 rejected as outside the data timing grid. Digit zero uses exception bucket one.
 With `K = 1`, no intentional exception digits remain.
 
-Every outcome deadline is `(bucket + 1) * resolution_hours * 3600` from script
-startup. Remaining wait is that deadline minus time already spent, including
+Every outcome deadline is `allowance_seconds + bucket * resolution_hours * 3600`
+from script startup. Remaining wait is that deadline minus time already spent, including
 calculation and writing. Maximum target equals `total_hours * 3600`; leave
 platform margin below the competition runtime cap. Setup's optional
 `--runtime-limit-hours` checks the full window, not just the remaining wait.
 
-Decoding subtracts calibrated platform overhead and the fixed first interval,
+Decoding subtracts calibrated platform overhead and the computation allowance,
 rounds to a bucket, then uses `d = channel * K + bucket - 1`. Reserved symbol
 zero raises a crash error. Default settings yield base 31 and five digits;
 fraction resolution is `1 / 31**5`. All leading zero digits are necessary.

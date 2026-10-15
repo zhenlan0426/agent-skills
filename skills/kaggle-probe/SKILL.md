@@ -43,7 +43,7 @@ python "$SKILL_DIR/scripts/probe.py" encode \
   --manifest probe-run/manifest.json --value 0.333333333333333333
 ```
 
-With `K = total_hours / resolution_hours` and `V` valid outcomes,
+With `K = (total_hours - allowance_hours) / resolution_hours + 1` buckets and `V` valid outcomes,
 `base = K * (3 + V) - 1`; capacity is `base ** digits`. Integer values must be
 in `[0, capacity - 1]`. Fractions are in `[0, 1]`; endpoint 1 maps to the last
 quantization interval. Digits are most significant first. Choose the smallest
@@ -51,10 +51,12 @@ digit count meeting the precision target and budget, using integer arithmetic
 for integer capacity. Defaults give base 31 and capacity `31**5 = 28,629,151`,
 about 85.3% of the previous 32-symbol capacity.
 
-The first resolution interval is the computation allowance, including adapter
-imports and output preparation. Outcome deadlines are `(bucket + 1) *
-resolution_hours` after script startup; the last deadline equals `total_hours`.
-Computation reduces the remaining wait rather than shifting the deadline.
+The computation allowance (`--allowance-hours`, default one resolution step)
+covers adapter imports, the quantity, and output preparation. Outcome deadlines
+are `allowance + bucket * resolution_hours` after script startup; the last equals
+`total_hours`. A separate allowance lets slow quantities or valid writers coexist
+with fine buckets, since bits per digit grow with `log2(K)`. Computation reduces
+the remaining wait rather than shifting the deadline.
 Choose a window below the competition cap to leave startup, shutdown, and
 platform margin. Optional `--runtime-limit-hours` rejects windows above the cap.
 
