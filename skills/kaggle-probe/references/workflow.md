@@ -203,8 +203,10 @@ using them as outcome signatures:
 }
 ```
 
-Patterns are case-insensitive regular expressions matched only against an
-`ERROR` submission's `errorDescription`. Exactly one rule must match. Unknown
+Patterns are case-insensitive regular expressions matched against the
+`errorDescription` of an `ERROR` submission, or of a `COMPLETE` one that carries
+an error description: Kaggle reports missing and malformed submission files as
+`COMPLETE` with an error and no score. Exactly one rule must match. Unknown
 or overlapping matches remain undecodable, with the raw error preserved.
 Timeout/cancelled statuses are terminal issues, never data outcomes. Do not use
 catchall error patterns to turn unrelated failures into valid digits.
@@ -246,8 +248,9 @@ On transport errors or identity ambiguity it stops; inspect the saved evidence
 before resuming. It does not retry or create submissions.
 
 Run the same command to resume the same manifest and mapping. State preserves
-the last pending timestamp and first terminal result rather than measuring a
-long-finished submission at each subsequent poll. A changed manifest or mapping
+the last pending timestamp and first terminal timing rather than measuring a
+long-finished submission at each subsequent poll; outcomes are re-derived from
+the stored terminal response on every poll, so classifier fixes apply on resume. A changed manifest or mapping
 requires a separate watch directory. Raw snapshots permit later manual audit or
 reclassification without another submission.
 

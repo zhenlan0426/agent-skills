@@ -65,6 +65,22 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(classify(submission(0, "COMPLETE", publicScore=".25"), ranges,
                                   Codec(valid_outcomes=2)), "valid:1")
 
+    def test_complete_with_error_description_uses_error_rules_and_resume_reclassifies(self):
+        codec = Codec(digits=1)
+        raw = submission(0, "COMPLETE", errorDescription="incorrect format", publicScore=None)
+        self.assertEqual(classify(raw, MAPPING, codec), "format")
+        probes = [{"index": 0, "description": "kaggle-probe:test:0"}]
+        state = {"records": {}}
+        update_records(state, [submission(0)], probes, EPOCH, MAPPING, codec)
+        update_records(state, [raw], probes, EPOCH + timedelta(seconds=60), {}, codec)
+        row = state["records"]["0"]["observation"]
+        self.assertIsNone(row["outcome"])
+        self.assertEqual(len(row["issues"]), 1)
+        update_records(state, [raw], probes, EPOCH + timedelta(seconds=90), MAPPING, codec)
+        self.assertEqual(row["outcome"], "format")
+        self.assertNotIn("issues", row)
+        self.assertEqual(row["elapsed_seconds"], "60.0")
+
     def test_already_terminal_has_no_poll_duration_but_explicit_duration_is_usable(self):
         probes = [{"index": 0, "description": "kaggle-probe:test:0"}]
         raw = submission(0, "COMPLETE", publicScore=".1", executionSeconds=1800)

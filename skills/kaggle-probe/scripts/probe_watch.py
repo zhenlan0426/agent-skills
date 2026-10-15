@@ -14,6 +14,7 @@ from probe_runtime import decimal
 
 PENDING = {"PENDING", "QUEUED", "RUNNING", "SUBMITTED"}
 TERMINAL = {"COMPLETE", "ERROR", "CANCELLED", "CANCELED", "TIMEOUT", "TIMED_OUT"}
+TIMING_ISSUES = ("Already terminal on first observation", "Cannot establish elapsed time")
 
 
 def timestamp(value):
@@ -48,7 +49,8 @@ def validate_mapping(mapping, codec):
 def classify(row, mapping, codec):
     status = str(row.get("status", "")).upper()
     error = row.get("errorDescription") or ""
-    if status == "ERROR":
+    # Kaggle reports missing/malformed submission files as COMPLETE with an error description.
+    if status == "ERROR" or (status == "COMPLETE" and error):
         matches = [r["outcome"] for r in mapping.get("error_rules", [])
                    if re.search(r["pattern"], error, re.IGNORECASE)]
     elif status == "COMPLETE" and not error:
@@ -118,6 +120,20 @@ class KaggleSource:
         return {"submissions": rows, "pagination_exhausted": exhausted}
 
 
+def classify_observation(row, raw, mapping, codec):
+    """Set the outcome from the raw terminal response, keeping any timing issues."""
+    issues = [issue for issue in row.get("issues", []) if issue.startswith(TIMING_ISSUES)]
+    try:
+        row["outcome"] = classify(raw, mapping, codec)
+    except ValueError as exc:
+        row["outcome"] = None
+        issues.append(str(exc))
+    if issues:
+        row["issues"] = issues
+    else:
+        row.pop("issues", None)
+
+
 def update_records(state, raw_rows, probes, now, mapping, codec, pending_at=None):
     by_description = {p["description"]: p for p in probes}
     seen = set()
@@ -135,7 +151,10 @@ def update_records(state, raw_rows, probes, now, mapping, codec, pending_at=None
         if record["submission_ref"] != ref:
             raise ValueError(f"Submission ref changed for digit {index}; inspect duplicate submissions")
         if record.get("terminal"):
-            continue  # Preserve the first terminal timestamp and elapsed time.
+            # Preserve the first terminal timestamp and elapsed time; re-derive the outcome so a
+            # resumed watch picks up classifier fixes from the stored terminal response.
+            classify_observation(record["observation"], record["raw"], mapping, codec)
+            continue
         status = str(raw.get("status", "")).upper()
         record["raw"] = raw
         record["last_seen_at"] = now.isoformat()
@@ -155,10 +174,6 @@ def update_records(state, raw_rows, probes, now, mapping, codec, pending_at=None
         if "kernel_version" in probe:
             row["kernel_version"] = probe["kernel_version"]
         issues = []
-        try:
-            row["outcome"] = classify(raw, mapping, codec)
-        except ValueError as exc:
-            issues.append(str(exc))
         field = mapping.get("duration_field")
         try:
             if field:
@@ -180,8 +195,8 @@ def update_records(state, raw_rows, probes, now, mapping, codec, pending_at=None
                 issues.append("Already terminal on first observation; no trustworthy elapsed time")
         except (KeyError, ValueError, InvalidOperation) as exc:
             issues.append(f"Cannot establish elapsed time: {exc}")
-        if issues:
-            row["issues"] = issues
+        row["issues"] = issues
+        classify_observation(row, raw, mapping, codec)
         record["observation"] = row
 
 
