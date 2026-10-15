@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kaggle Probe"
+  short_description: "Encode and decode Kaggle submission probes"
+  default_prompt: "Use $kaggle-probe to prepare a reusable probe for my Kaggle code competition."
