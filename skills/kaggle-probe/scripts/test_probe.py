@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from probe import decode_observations
@@ -32,7 +33,7 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual(codec.decode(digits, "integer"), {"integer": value})
                 for digit in digits:
                     signal = codec.signal(digit)
-                    elapsed = Decimal(signal["sleep_seconds"]) + Decimal("42.1")
+                    elapsed = Decimal(signal["target_seconds"]) + Decimal("42.1")
                     self.assertEqual(codec.observe(elapsed, signal["outcome"], "42.1", 1), digit)
 
     def test_fraction_bounds_and_endpoint(self):
@@ -44,11 +45,11 @@ class ProbeTests(unittest.TestCase):
                 self.assertLessEqual(Decimal(value), Decimal(interval["upper"]))
             else:
                 self.assertLess(Decimal(value), Decimal(interval["upper"]))
-        self.assertEqual(codec.encode(1), [31] * 5)
+        self.assertEqual(codec.encode(1), [30] * 5)
 
     def test_leading_zero_and_capacity_boundaries(self):
         codec = Codec(digits=3)
-        self.assertEqual(codec.encode(32, "integer"), [0, 1, 0])
+        self.assertEqual(codec.encode(31, "integer"), [0, 1, 0])
         self.assertEqual(codec.encode(0, "integer"), [0, 0, 0])
         for value, mode in ((codec.capacity, "integer"), (-1, "integer"), (1.5, "integer"),
                             ("1.0000001", "fraction"), (-0.1, "fraction"), ("NaN", "fraction")):
@@ -60,10 +61,61 @@ class ProbeTests(unittest.TestCase):
     def test_unknown_errors_and_bad_timing_are_rejected(self):
         codec = Codec()
         for args in ((217, "unknown", 217, 100), (217, "timeout", 217, 100),
-                     (217 + 900, "missing", 217, 100), (217 + 8 * 1800, "missing", 217, 100),
+                     (217 + 900, "missing", 217, 100), (217 + 9 * 1800, "missing", 217, 100),
                      (0, "missing", 217, 100), (217, "missing", 217, 900)):
             with self.assertRaises(ValueError):
                 codec.observe(*args)
+
+    def test_crash_slot_is_reserved_but_zero_remains_encodable(self):
+        codec = Codec()
+        self.assertEqual(codec.base, 31)
+        self.assertEqual(codec.capacity, 28629151)
+        with self.assertRaisesRegex(ValueError, "Reserved crash"):
+            codec.observe(1800 + 42, "exception", 42, 10)
+        with self.assertRaises(ValueError):
+            codec.observe(42, "exception", 42, 10)
+        signal = codec.signal(0)
+        self.assertEqual(signal["outcome"], "exception")
+        self.assertEqual(signal["target_seconds"], "3600.0")
+        self.assertEqual(codec.observe(3642, "exception", 42, 10), 0)
+
+    def test_compute_and_writer_time_do_not_shift_the_deadline(self):
+        codec = Codec(digits=1)
+        for computed_at in (10, 500, 1700):
+            waits = []
+            current = [computed_at]
+            with tempfile.TemporaryDirectory() as folder, working_directory(folder):
+                def write_valid(index):
+                    current[0] += 20
+                    Path("submission.csv").write_text("valid")
+
+                emit_signal(codec, 3 * codec.buckets - 1, False, write_valid, None,
+                            started_at=0, clock=lambda: current[0], sleep=waits.append)
+            self.assertEqual(waits, [1800 - computed_at - 20])
+
+    def test_calculation_failure_and_timeout_use_reserved_slot(self):
+        runtime = Path(__file__).with_name("probe_runtime.py").read_text()
+        with tempfile.TemporaryDirectory() as folder:
+            for computation in ('raise ValueError("bad quantity")',
+                                'return 999999', 'time.sleep(10)'):
+                adapter = f'''\ndef is_toy(): return False
+def quantity(): {computation}
+def write_valid_submission(index): raise AssertionError("unexpected writer")
+def write_invalid_submission(): raise AssertionError("unexpected writer")
+'''
+                # 180ms computation allowance; watchdog must stop a 10s sleep.
+                source = 'import time\n_started = time.monotonic()\n' + runtime
+                source += f'\nrun_probe(Codec("0.0002", "0.00005", 1), 0, "integer", {adapter!r}, "submission.csv", _started)\n'
+                notebook = Path(folder) / "probe.py"
+                notebook.write_text(source)
+                started = time.monotonic()
+                result = subprocess.run([sys.executable, str(notebook)], cwd=folder,
+                                        capture_output=True, text=True, timeout=3)
+                elapsed = time.monotonic() - started
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("KAGGLE_PROBE_EXCEPTION", result.stderr)
+                self.assertGreater(elapsed, 0.16)
+                self.assertLess(elapsed, 2)
 
     def test_emitter_branches_without_sleeping(self):
         codec = Codec(digits=1, valid_outcomes=2)
@@ -77,18 +129,18 @@ class ProbeTests(unittest.TestCase):
                 signal = codec.signal(digit)
                 if signal["outcome"] == "exception":
                     with self.assertRaisesRegex(RuntimeError, "KAGGLE_PROBE_EXCEPTION"):
-                        emit_signal(codec, digit, False, valid, invalid, sleep=waits.append)
+                        emit_signal(codec, digit, False, valid, invalid, started_at=0, clock=lambda: 0, sleep=waits.append)
                     self.assertFalse(output.exists())
                 else:
-                    emit_signal(codec, digit, False, valid, invalid, sleep=waits.append)
+                    emit_signal(codec, digit, False, valid, invalid, started_at=0, clock=lambda: 0, sleep=waits.append)
                     if signal["outcome"] == "missing":
                         self.assertFalse(output.exists())
                     else:
                         expected = "invalid" if signal["outcome"] == "format" else signal["outcome"]
                         self.assertEqual(output.read_text(), expected)
-                self.assertEqual(waits, [float(signal["sleep_seconds"])])
+                self.assertEqual(waits, [float(signal["target_seconds"])])
             waits = []
-            emit_signal(codec, None, True, valid, invalid, sleep=waits.append)
+            emit_signal(codec, None, True, valid, invalid, started_at=0, clock=lambda: 0, sleep=waits.append)
             self.assertEqual(output.read_text(), "valid:0")
             self.assertEqual(waits, [])
 
@@ -108,6 +160,12 @@ def write_invalid_submission():
     raise AssertionError("Toy run must not write invalid submission")
 ''')
             run = root / "run"
+            rejected = subprocess.run([sys.executable, str(script), "prepare", "--competition", "example",
+                                       "--kernel", "owner/example-probe", "--adapter", str(adapter),
+                                       "--output", str(run), "--runtime-limit-hours", "3"],
+                                      capture_output=True, text=True)
+            self.assertEqual(rejected.returncode, 2)
+            self.assertFalse(run.exists())
             subprocess.run([sys.executable, str(script), "prepare", "--competition", "example",
                             "--kernel", "owner/example-probe", "--adapter", str(adapter),
                             "--output", str(run), "--digits", "2", "--mode", "integer"],
@@ -126,26 +184,28 @@ def write_invalid_submission():
                 self.assertEqual((notebook.parent / "submission.csv").read_text(), "valid toy")
                 signal = codec.signal(digit)
                 observations.append({"index": entry["index"], "description": entry["description"],
-                                     "elapsed_seconds": str(Decimal(signal["sleep_seconds"]) + 217),
+                                     "elapsed_seconds": str(Decimal(signal["target_seconds"]) + 217),
                                      "outcome": signal["outcome"]})
                 # Run hidden entrypoint in isolation, injecting a no-wait emitter.
                 source = notebook.read_text().replace('return True', 'return False').replace(
-                    'raise AssertionError("Toy run must not compute quantity")', 'return 73')
+                    'raise AssertionError("Toy run must not compute quantity")', 'return 71')
                 namespace = {"__name__": "probe_test"}
                 exec(compile(source, str(notebook), "exec"), namespace)
                 emitted = []
-                namespace["emit_signal"] = lambda *args: emitted.append(args[1])
+                namespace["emit_signal"] = lambda *args, **kwargs: emitted.append(args[1])
                 namespace["__name__"] = "__main__"
                 entrypoint = source[source.rfind('if __name__ == "__main__":'):]
                 exec(entrypoint, namespace)
                 self.assertEqual(emitted, [[2, 9][entry["index"]]])
-            self.assertEqual(decode_observations(manifest, codec, observations[::-1], 217, 100)["integer"], 73)
+            self.assertEqual(decode_observations(manifest, codec, observations[::-1], 217, 100)["integer"], 71)
             for bad in (observations[:1], observations + [observations[0]],
-                        [{**observations[0], "description": "different-run"}, observations[1]]):
+                        [{**observations[0], "description": "different-run"}, observations[1]],
+                        [{**observations[0], "issues": ["uncalibrated"]}, observations[1]],
+                        [{**observations[0], "elapsed_lower_seconds": "0"}, observations[1]]):
                 with self.assertRaises(ValueError):
                     decode_observations(manifest, codec, bad, 217, 100)
             encoded = subprocess.run([sys.executable, str(script), "encode", "--manifest",
-                                      str(run / "manifest.json"), "--value", "73"],
+                                      str(run / "manifest.json"), "--value", "71"],
                                      check=True, capture_output=True, text=True)
             self.assertEqual(json.loads(encoded.stdout)["digits"], [2, 9])
             observed = root / "observations.json"
@@ -154,7 +214,7 @@ def write_invalid_submission():
                                       str(run / "manifest.json"), "--observations", str(observed),
                                       "--overhead-seconds", "217", "--tolerance-seconds", "100"],
                                      check=True, capture_output=True, text=True)
-            self.assertEqual(json.loads(decoded.stdout)["integer"], 73)
+            self.assertEqual(json.loads(decoded.stdout)["integer"], 71)
 
 
 if __name__ == "__main__":

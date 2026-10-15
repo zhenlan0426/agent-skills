@@ -9,13 +9,13 @@ from pathlib import Path
 import re
 import uuid
 
-from probe_runtime import Codec
+from probe_runtime import Codec, decimal
 
 
 def load_manifest(path):
     manifest = json.loads(Path(path).read_text())
-    if manifest.get("schema_version") != 1:
-        raise ValueError("Unsupported manifest schema")
+    if manifest.get("schema_version") != 2:
+        raise ValueError("Unsupported manifest schema; prepare a new run with the crash-reserving codec")
     return manifest, Codec(**manifest["codec"])
 
 
@@ -24,6 +24,10 @@ def prepare(args):
     if not re.fullmatch(r"[\w-]+/[a-z0-9]{2,}(-[a-z0-9]+)*", args.kernel):
         raise ValueError("Kernel must be owner/slug, with a lowercase hyphenated slug of 2+ characters")
     codec = Codec(args.total_hours, args.resolution_hours, args.digits, args.valid_outcomes)
+    if args.runtime_limit_hours is not None:
+        limit = decimal(args.runtime_limit_hours)
+        if limit <= 0 or decimal(codec.total_hours) > limit:
+            raise ValueError("Configured time window exceeds the runtime limit (or limit is not positive)")
     adapter = Path(args.adapter).read_text()
     tree = ast.parse(adapter, filename=args.adapter)
     hooks = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
@@ -48,24 +52,25 @@ def prepare(args):
         entrypoint = f'''
 if __name__ == "__main__":
     _probe_codec = Codec(**{asdict(codec)!r})
-    _probe_toy = bool(is_toy())
-    _probe_digit = 0 if _probe_toy else _probe_codec.encode(quantity(), {args.mode!r})[{index}]
-    emit_signal(_probe_codec, _probe_digit, _probe_toy,
-                write_valid_submission, write_invalid_submission, {args.submission_file!r})
+    run_probe(_probe_codec, {index}, {args.mode!r}, {adapter!r},
+              {args.submission_file!r}, _probe_started_at)
 '''
-        source = runtime + "\n# Competition adapter\n" + adapter + "\n" + entrypoint
+        source = "import time\n_probe_started_at = time.monotonic()\n" + runtime + "\n" + entrypoint
         compile(source, str(folder / "probe.py"), "exec")
         probes.append({"index": index, "kernel": kernel, "folder": folder.name,
                        "description": f"kaggle-probe:{run_id}:{index}"})
         folder.mkdir(parents=True)
         (folder / "probe.py").write_text(source)
         (folder / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    manifest = {"schema_version": 1, "run_id": run_id, "competition": args.competition,
+    manifest = {"schema_version": 2, "run_id": run_id, "competition": args.competition,
                 "mode": args.mode, "submission_file": args.submission_file,
+                "runtime_limit_hours": args.runtime_limit_hours,
                 "codec": asdict(codec), "probes": probes}
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return {"manifest": str(root / "manifest.json"), "base": codec.base,
-            "capacity": codec.capacity, "max_sleep_seconds": str((codec.buckets - 1) * codec.step_seconds),
+            "capacity": codec.capacity, "computation_allowance_seconds": str(codec.step_seconds),
+            "max_target_seconds": str(codec.buckets * codec.step_seconds),
+            "enable_gpu": False, "enable_internet": False,
             "submission_count": codec.digits}
 
 
@@ -80,7 +85,15 @@ def decode_observations(manifest, codec, observations, overhead, tolerance):
             raise ValueError("Unexpected or duplicate probe index")
         if row["description"] != expected[index]:
             raise ValueError("Observation description does not match this run")
+        if row.get("issues"):
+            raise ValueError(f"Digit {index} has unresolved observation issues: {row['issues']}")
         digits[index] = codec.observe(row["elapsed_seconds"], row["outcome"], overhead, tolerance)
+        if row.get("elapsed_lower_seconds") is not None:
+            lower = row["elapsed_lower_seconds"]
+            if decimal(lower) > decimal(row["elapsed_seconds"]):
+                raise ValueError("Observation time bounds are reversed")
+            if codec.observe(lower, row["outcome"], overhead, tolerance) != digits[index]:
+                raise ValueError("Polling time bounds do not identify the same digit")
     if set(digits) != set(expected):
         raise ValueError("Missing probe observations")
     ordered = [digits[i] for i in range(codec.digits)]
@@ -97,10 +110,19 @@ def main():
     prep.add_argument("--output", required=True)
     prep.add_argument("--mode", choices=["fraction", "integer"], default="fraction")
     prep.add_argument("--total-hours", default="4")
+    prep.add_argument("--runtime-limit-hours", help="Reject a configured window above this competition runtime cap")
     prep.add_argument("--resolution-hours", default="0.5")
     prep.add_argument("--digits", type=int, default=5)
     prep.add_argument("--valid-outcomes", type=int, default=1)
     prep.add_argument("--submission-file", default="submission.csv")
+    watch = sub.add_parser("watch", help="Read-only Kaggle polling; save snapshots and normalized observations")
+    watch.add_argument("--manifest", required=True)
+    watch.add_argument("--mapping", required=True, help="JSON error regexes, score ranges, and optional duration field")
+    watch.add_argument("--output", required=True, help="Watch directory, resumed if already present")
+    watch.add_argument("--poll-seconds", type=float, default=20)
+    watch.add_argument("--timeout-seconds", type=float, required=True)
+    watch.add_argument("--page-size", type=int, default=100)
+    watch.add_argument("--max-pages", type=int, default=20)
     for command in ("encode", "decode"):
         child = sub.add_parser(command)
         child.add_argument("--manifest", required=True)
@@ -114,6 +136,9 @@ def main():
     try:
         if args.command == "prepare":
             result = prepare(args)
+        elif args.command == "watch":
+            from probe_watch import watch_run
+            result = watch_run(args)
         else:
             manifest, codec = load_manifest(args.manifest)
             if args.command == "encode":
@@ -124,7 +149,7 @@ def main():
                 observations = json.loads(Path(args.observations).read_text())
                 result = decode_observations(manifest, codec, observations, args.overhead_seconds, args.tolerance_seconds)
         print(json.dumps(result, indent=2))
-    except (ValueError, KeyError, TypeError, OSError) as exc:
+    except (ValueError, KeyError, TypeError, OSError, SyntaxError) as exc:
         parser.exit(2, f"error: {exc}\n")
 
 

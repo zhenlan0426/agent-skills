@@ -1,13 +1,17 @@
 """Portable timing/outcome codec; also embedded verbatim in generated notebooks."""
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP, localcontext
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP, localcontext
 from pathlib import Path
+import signal as signals
 import time
 
 
 def decimal(value):
-    number = Decimal(str(value))
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError(f"Expected a finite number, got {value!r}") from exc
     if not number.is_finite():
         raise ValueError("Values must be finite")
     return number
@@ -41,7 +45,8 @@ class Codec:
 
     @property
     def base(self):
-        return self.buckets * (3 + self.valid_outcomes)
+        # Exception in bucket zero is reserved for a failed computation.
+        return self.buckets * (3 + self.valid_outcomes) - 1
 
     @property
     def capacity(self):
@@ -89,9 +94,10 @@ class Codec:
     def signal(self, digit):
         if type(digit) is not int or not 0 <= digit < self.base:
             raise ValueError(f"Digit must be an integer in [0, {self.base - 1}]")
-        outcome_index, bucket = divmod(digit, self.buckets)
+        outcome_index, bucket = divmod(digit + 1, self.buckets)
         outcome = ("exception", "missing", "format")[outcome_index] if outcome_index < 3 else f"valid:{outcome_index - 3}"
-        return {"digit": digit, "bucket": bucket, "sleep_seconds": str(bucket * self.step_seconds), "outcome": outcome}
+        return {"digit": digit, "bucket": bucket,
+                "target_seconds": str((bucket + 1) * self.step_seconds), "outcome": outcome}
 
     def observe(self, elapsed_seconds, outcome, overhead_seconds, tolerance_seconds):
         overhead, tolerance = decimal(overhead_seconds), decimal(tolerance_seconds)
@@ -100,7 +106,7 @@ class Codec:
         elapsed = decimal(elapsed_seconds)
         if elapsed < 0:
             raise ValueError("Elapsed time must be nonnegative")
-        corrected = elapsed - overhead
+        corrected = elapsed - overhead - self.step_seconds
         bucket = int((corrected / self.step_seconds).to_integral_value(rounding=ROUND_HALF_UP))
         if not 0 <= bucket < self.buckets:
             raise ValueError("Observed time is outside the configured buckets")
@@ -110,11 +116,15 @@ class Codec:
         known.update({f"valid:{i}": i + 3 for i in range(self.valid_outcomes)})
         if outcome not in known:
             raise ValueError(f"Unknown outcome: {outcome!r}; do not infer a valid outcome from an unknown error")
-        return known[outcome] * self.buckets + bucket
+        symbol = known[outcome] * self.buckets + bucket
+        if symbol == 0:
+            raise ValueError("Reserved crash signal: the hidden computation failed; this is not digit zero")
+        return symbol - 1
 
 
-def emit_signal(codec, digit, is_toy, write_valid, write_invalid, submission_file="submission.csv", sleep=time.sleep):
-    """Emit one digit. Inject sleep in local tests to avoid real delays."""
+def emit_signal(codec, digit, is_toy, write_valid, write_invalid, submission_file="submission.csv",
+                *, started_at, sleep=time.sleep, clock=time.monotonic, ready=None):
+    """Prepare output before waiting for an absolute deadline from script startup."""
     output = Path(submission_file)
     output.unlink(missing_ok=True)
     if is_toy:
@@ -123,15 +133,68 @@ def emit_signal(codec, digit, is_toy, write_valid, write_invalid, submission_fil
             raise ValueError("Valid writer did not create the submission file")
         return
     signal = codec.signal(digit)
-    sleep(float(signal["sleep_seconds"]))
     outcome = signal["outcome"]
-    if outcome == "exception":
-        raise RuntimeError("KAGGLE_PROBE_EXCEPTION")
-    if outcome == "missing":
-        return
     if outcome == "format":
         write_invalid()
-    else:
+    elif outcome.startswith("valid:"):
         write_valid(int(outcome.split(":")[1]))
-    if not output.is_file():
-        raise ValueError("Submission writer did not create the expected file")
+    if outcome in ("format",) or outcome.startswith("valid:"):
+        if not output.is_file():
+            raise ValueError("Submission writer did not create the expected file")
+    if clock() - started_at >= float(codec.step_seconds):
+        raise TimeoutError("Probe preparation exceeded the computation allowance")
+    if ready is not None:
+        ready()  # Disarm the computation watchdog only after output is ready.
+    wait_until(started_at + float(signal["target_seconds"]), sleep, clock)
+    if outcome == "exception":
+        raise RuntimeError("KAGGLE_PROBE_EXCEPTION")
+
+
+def wait_until(deadline, sleep=time.sleep, clock=time.monotonic):
+    remaining = deadline - clock()
+    if remaining > 0:
+        sleep(remaining)
+
+
+def run_probe(codec, index, mode, adapter_source, submission_file, started_at):
+    """Kaggle/Linux entrypoint; bound computation failures to the reserved slot.
+
+    Adapter imports, quantity calculation, encoding and output preparation all
+    run under a real-time watchdog. No adapter code runs after the timed wait.
+    """
+    def timed_out(signum, frame):
+        raise TimeoutError("Probe preparation exceeded the computation allowance")
+
+    def disarm():
+        signals.setitimer(signals.ITIMER_REAL, 0)
+
+    previous = signals.signal(signals.SIGALRM, timed_out)
+    armed = True
+    toy = False
+
+    def ready():
+        nonlocal armed
+        disarm()
+        armed = False
+
+    try:
+        remaining = started_at + float(codec.step_seconds) - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Runtime imports exceeded the computation allowance")
+        signals.setitimer(signals.ITIMER_REAL, remaining)
+        namespace = globals()
+        exec(compile(adapter_source, "adapter.py", "exec"), namespace)
+        toy = bool(namespace["is_toy"]())
+        digit = 0 if toy else codec.encode(namespace["quantity"](), mode)[index]
+        emit_signal(codec, digit, toy, namespace["write_valid_submission"],
+                    namespace["write_invalid_submission"], submission_file,
+                    started_at=started_at, ready=ready)
+    except BaseException:
+        if armed:
+            disarm()
+            if not toy:
+                wait_until(started_at + float(codec.step_seconds))
+        raise
+    finally:
+        disarm()
+        signals.signal(signals.SIGALRM, previous)
