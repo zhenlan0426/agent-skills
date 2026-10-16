@@ -15,7 +15,7 @@ Bits per submission = `log2(K · (3 + V) − 1)`. For example, with K = 31 bucke
 | Snapshot scores | `scripts/fetch_listing.sh <slug> <competition-id> listing.json`. Anonymous curl to the endpoints behind kaggle.com's code page (`ListKernels` `bestPublicScore`, `ListKernelVersions`). The public API exposes neither. The id comes from `KaggleApi().competitions_list(search=slug)[0].id`. Only the top 100 by score are returned. |
 | Pull | `known_scores.py pull owner/slug --listing listing.json --dest notebooks/` writes `<owner>__<slug>/{code, embed.json}`, with outputs stripped and inputs pinned. |
 | Smoke | `known_scores.smoke_kernel(...)` builds a private script kernel. It runs each notebook once on the visible test and `repeats` times on a synthetic hidden-size test, then writes `smoke.json`. Push it and fetch the output. |
-| Select | `known_scores.py select --notebook ... --smoke smoke.json --baseline-score <valid:0 score> --gap 0.010` |
+| Select | `known_scores.py select --notebook ... --smoke smoke.json --baseline-score <valid:0 score> --gap 0.010`. Pass every smoke file; for a notebook version in several, the last one listed wins (list reruns last). |
 | Rules | `known_scores.py rules <valid:0 score> <valid:1 score> ... --margin 0.004` gives the watcher `valid_rules` |
 | Adapter | `known_scores.adapter_prefix(notebooks, input_paths)` + the project's hooks + `quantity()`. The hooks call `run_notebook(EMBEDDED_NOTEBOOKS[i-1], submission_file)`, which returns a path to a copy of the notebook's submission. |
 | Kernel settings | `known_scores.kernel_settings(notebooks, allow_gpu, docker_image, competition)` is merged into every probe kernel's metadata. Pass `prepare --gpu` when it enables a GPU. |

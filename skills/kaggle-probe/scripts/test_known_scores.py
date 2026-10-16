@@ -55,6 +55,10 @@ class KnownScoreTests(unittest.TestCase):
             self.assertEqual(set(result['rejected']), {'x/b', 'x/d', 'x/e', 'x/f'})
             cpu = known_scores.select(folders, [root / 'smoke.json'], '0.055', cpu_only=True)
             self.assertEqual([c['kernel'] for c in cpu['chosen']], ['x/b'])
+            rerun = [{**row, 'ok': True} for row in smoke if row['kernel'] == 'x/e']
+            (root / 'rerun.json').write_text(json.dumps(rerun))
+            result = known_scores.select(folders, [root / 'smoke.json', root / 'rerun.json'], '0.055')
+            self.assertEqual([c['kernel'] for c in result['chosen']], ['x/a', 'x/c', 'x/e'])
 
     def test_runner_returns_submission_and_kills_timed_out_tree(self):
         namespace = {}

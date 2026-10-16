@@ -217,11 +217,14 @@ def smoke_kernel(notebooks, hooks_source, input_paths, kernel, output, settings,
 
 def select(folders, smoke_paths, baseline_score, gap='0.010', max_seconds=900, min_agreement=1.0, cpu_only=False):
     """Drop smoke failures, nondeterminism, and slow runs, then keep the largest set whose scores (with the
-    baseline's) are pairwise >= gap apart. Greedy over sorted scores is optimal for this."""
+    baseline's) are pairwise >= gap apart. Greedy over sorted scores is optimal for this. For a notebook version
+    in several smoke files, only the last file's rows count."""
     runs = {}
     for path in smoke_paths:
+        rows = {}
         for row in json.loads(Path(path).read_text()):
-            runs.setdefault((row['kernel'], row['version']), []).append(row)
+            rows.setdefault((row['kernel'], row['version']), []).append(row)
+        runs.update(rows)  # a later smoke file (e.g. a rerun after a harness fix) supersedes earlier ones
     eligible, rejected = [], {}
     for folder in folders:
         nb = load_notebook(folder)
