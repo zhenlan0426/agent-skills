@@ -59,12 +59,22 @@ class KnownScoreTests(unittest.TestCase):
     def test_runner_returns_submission_and_kills_timed_out_tree(self):
         namespace = {}
         exec(known_scores.adapter_prefix([], ['/kaggle/input/comp']), namespace)
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as root:
             writer = {'kernel': 'x/w', 'code_file': 'w.py',
                       'source': "open('out.csv', 'w').write(open('/kaggle/input/comp/x').read())\n"}
             Path(folder, 'x').write_text('rewritten input')
             path = namespace['run_notebook'](writer, 'out.csv', input_dir=folder)
             self.assertEqual(path.read_text(), 'rewritten input')
+            root = Path(root)  # fake INPUT_ROOT, kept apart from the rewritten input `folder`
+            scanner = {'kernel': 'x/g', 'code_file': 'g.py', 'source': (
+                f"import glob\nfound = sorted(glob.glob('{root}/**/x', recursive=True))\n"
+                "open('out.csv', 'w').write('|'.join(open(p).read() for p in found))\n")}
+            for name, text in (('comp/x', 'hidden input'), ('comp/y', 'kept'), ('weights/deep/x', 'weights')):
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text)
+            namespace['INPUT_ROOT'], namespace['INPUT_PATHS'] = str(root), (str(root / 'comp'),)
+            path = namespace['run_notebook'](scanner, 'out.csv', input_dir=folder)
+            self.assertEqual(path.read_text(), 'rewritten input|weights')
             sleeper = {'kernel': 'x/s', 'code_file': 's.py',
                        'source': "import time\ntime.sleep(30)\nopen('out.csv', 'w').write('late')\n"}
             with self.assertRaises(subprocess.TimeoutExpired):

@@ -75,8 +75,11 @@ def pull(kernel, listing, dest_root, score=None, allow_kernel_sources=False):
         raise ValueError('The notebook changed since the listing snapshot; re-run fetch_listing.sh')
     if meta['language'] != 'python':
         raise ValueError(f"Only Python notebooks can be embedded, got {meta['language']!r}")
-    if any(not ref for ref in meta['kernelDataSources']):
-        raise ValueError('A notebook-output input is private or deleted, so the probe cannot attach it')
+    for key in ('datasetDataSources', 'kernelDataSources', 'modelDataSources'):
+        if any(not ref for ref in meta[key]):
+            # Private or deleted inputs come back empty; so did a public model once (2026-10-15), transiently.
+            raise ValueError(f'An input in {key} came back empty (private, deleted, or an API glitch); '
+                             'retry the pull, and drop the notebook if it persists')
     if meta['kernelDataSources'] and not allow_kernel_sources:
         raise ValueError('Reads other notebooks\' outputs, which cannot be pinned to the scored run; '
                          'pass --allow-kernel-sources to accept the drift risk')

@@ -23,7 +23,10 @@ Bits per submission = `log2(K · (3 + V) − 1)`. For example, with K = 31 bucke
 The smoke kernel's hooks source must define `INPUT`, `SUBMISSION_FILE`, `read_test()`, `read_submission(path)`,
 `check_submission(submission, test)`, `synthetic_input(source, dest, rows) -> (test, truth or None)`, and
 `predictions(submission, test)` (labels aligned with test rows). `input_paths` lists the competition input paths that
-notebooks hard-code, which the smoke run rewrites to the synthetic input.
+notebooks hard-code, which the smoke run rewrites to the synthetic input. Notebooks that instead find the data by
+scanning `/kaggle/input` (`rglob('train.csv')`, `glob('/kaggle/input/**/…')`) get `/kaggle/input` rewritten to a mirror
+of that tree (`notebook_runner.mirror_input`: real dirs, symlinked files) whose `input_paths` dirs hold the synthetic
+files. Without it they read the visible test and fail the id check on every synthetic run.
 
 ## Robustness rules (enforced unless marked manual)
 

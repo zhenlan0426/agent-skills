@@ -12,17 +12,19 @@ import tempfile
 
 EMBEDDED_NOTEBOOKS = []  # [{'kernel', 'version', 'code_file', 'source'}, ...]
 INPUT_PATHS = ()  # Competition input paths notebooks hard-code; `input_dir` rewrites them (smoke tests).
+INPUT_ROOT = '/kaggle/input'  # Notebooks that scan it for the data instead see `mirror_input` (smoke tests).
 
 
 def run_notebook(notebook, submission_file, input_dir=None, timeout=None):
     """Run an embedded notebook in a scratch directory; return the path of a copy of its submission file."""
     source = notebook['source']
-    if input_dir is not None:
-        for path in INPUT_PATHS:
-            source = source.replace(path, str(input_dir))
     stray = Path.cwd() / submission_file
     stray.unlink(missing_ok=True)
-    with tempfile.TemporaryDirectory() as folder:
+    with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as mirror:
+        if input_dir is not None:
+            for path in INPUT_PATHS:
+                source = source.replace(path, str(input_dir))
+            source = source.replace(INPUT_ROOT, str(mirror_input(input_dir, Path(mirror))))
         work = Path(folder)
         code = work / notebook['code_file']
         code.write_text(source)
@@ -51,6 +53,21 @@ def run_notebook(notebook, submission_file, input_dir=None, timeout=None):
                 shutil.move(path, kept)
                 return kept
     raise ValueError(f"{notebook['kernel']} wrote no {submission_file}")
+
+
+def mirror_input(input_dir, mirror):
+    """Copy of the INPUT_ROOT tree (real directories, symlinked files) whose INPUT_PATHS directories hold
+    `input_dir`'s files, so a notebook that finds the data by scanning (e.g. `rglob('train.csv')`) reads `input_dir`."""
+    root = Path(INPUT_ROOT)
+    for folder, dirs, files in os.walk(root, followlinks=True):
+        target = mirror / Path(folder).relative_to(root)
+        target.mkdir(parents=True, exist_ok=True)
+        source = Path(folder)
+        if str(source) in INPUT_PATHS:
+            dirs[:], source, files = [], Path(input_dir), os.listdir(input_dir)
+        for name in files:
+            (target / name).symlink_to((source / name).resolve())
+    return mirror
 
 
 def kill_tree(root):
