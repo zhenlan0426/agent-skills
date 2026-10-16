@@ -184,9 +184,24 @@ def write_invalid_submission():
                                       capture_output=True, text=True)
             self.assertEqual(rejected.returncode, 2)
             self.assertFalse(run.exists())
-            subprocess.run([sys.executable, str(script), "prepare", "--competition", "example",
-                            "--kernel", "owner/example-probe", "--adapter", str(adapter),
-                            "--output", str(run), "--digits", "2", "--mode", "integer"],
+            base = [sys.executable, str(script), "prepare", "--competition", "example",
+                    "--kernel", "owner/example-probe", "--adapter", str(adapter), "--mode", "integer"]
+            unmeasured = subprocess.run(base + ["--output", str(run), "--digits", "2"],
+                                        capture_output=True, text=True)
+            self.assertIn("--noise-runs", unmeasured.stderr)
+            calib = root / "calib"
+            subprocess.run(base + ["--output", str(calib), "--digits", "1", "--calibrate", "valid:0@0"],
+                           check=True, capture_output=True, text=True)
+            calib_manifest = json.loads((calib / "manifest.json").read_text())
+            self.assertEqual(calib_manifest["calibrate"], "valid:0@0")
+            (calib / "watch").mkdir()
+            (calib / "watch" / "observations.json").write_text(json.dumps([{
+                "index": 0, "description": calib_manifest["probes"][0]["description"], "outcome": "valid:0",
+                "elapsed_lower_seconds": "2000", "elapsed_seconds": "2027"}]))
+            gpu = subprocess.run(base + ["--output", str(run), "--digits", "2", "--gpu", "--noise-runs", str(calib)],
+                                 capture_output=True, text=True)
+            self.assertIn("No measured timing for GPU", gpu.stderr)
+            subprocess.run(base + ["--output", str(run), "--digits", "2", "--noise-runs", str(calib)],
                            check=True, capture_output=True, text=True)
             manifest = json.loads((run / "manifest.json").read_text())
             for entry in manifest["probes"]:
@@ -233,6 +248,16 @@ def write_invalid_submission():
                                       "--overhead-seconds", "217", "--tolerance-seconds", "100"],
                                      check=True, capture_output=True, text=True)
             self.assertEqual(json.loads(decoded.stdout)["integer"], 71)
+            # Budget from the calibration: overhead 214 s, tolerance 200 s (floor); one digit still missing.
+            observed.write_text(json.dumps(observations[:1]))
+            partial = subprocess.run([sys.executable, str(script), "decode", "--manifest",
+                                      str(run / "manifest.json"), "--observations", str(observed),
+                                      "--noise-runs", str(calib), str(run), "--partial"],
+                                     check=True, capture_output=True, text=True)
+            partial = json.loads(partial.stdout)
+            self.assertEqual((partial["overhead_seconds"], partial["tolerance_seconds"]), (214, 200))
+            self.assertEqual(partial["digits"][0]["digit"], 2)
+            self.assertEqual(partial["undecoded"], [1])
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP, localcontext
+import math
 from pathlib import Path
 import signal as signals
 import time
@@ -112,6 +113,18 @@ class Codec:
         return {"digit": digit, "bucket": bucket,
                 "target_seconds": str(self.target_seconds(bucket)), "outcome": outcome}
 
+    def calibration_digit(self, spec):
+        """Digit that emits `outcome@bucket`, e.g. `valid:0@0`; the reserved crash slot is refused."""
+        outcome, bucket = spec.rsplit("@", 1)
+        channels = ("exception", "missing", "format")
+        channel = channels.index(outcome) if outcome in channels else 3 + int(outcome.split(":")[1])
+        digit = channel * self.buckets + int(bucket) - 1
+        if not 0 <= digit < self.base or (self.signal(digit)["outcome"], self.signal(digit)["bucket"]) != (
+                outcome, int(bucket)):
+            raise ValueError(f"{spec} is not an emittable signal (exception@0 is reserved for crashes)")
+        return digit
+
+
     def observe(self, elapsed_seconds, outcome, overhead_seconds, tolerance_seconds):
         overhead, tolerance = decimal(overhead_seconds), decimal(tolerance_seconds)
         if overhead < 0 or not 0 <= tolerance < self.step_seconds / 2:
@@ -133,6 +146,34 @@ class Codec:
         if symbol == 0:
             raise ValueError("Reserved crash signal: the hidden computation failed; this is not digit zero")
         return symbol - 1
+
+
+class LogScale:
+    """Map a positive statistic to an integer code in [0, levels - 1] on a log grid from lo to hi."""
+
+    def __init__(self, lo, hi, levels):
+        self.lo, self.hi, self.levels = float(lo), float(hi), int(levels)
+        self.step = math.log(self.hi / self.lo) / (self.levels - 1)
+
+    def code(self, value):
+        return min(max(round(math.log(float(value) / self.lo) / self.step), 0), self.levels - 1)
+
+    def interval(self, code):
+        """Values that encode to `code`; the end codes also absorb everything clipped beyond lo/hi."""
+        lower = 0.0 if code == 0 else self.lo * math.exp((code - 0.5) * self.step)
+        upper = math.inf if code == self.levels - 1 else self.lo * math.exp((code + 0.5) * self.step)
+        return lower, upper
+
+
+def pack_digits(codes, base):
+    """Combine per-probe codes (most significant first) into one integer for `--mode integer`."""
+    value = 0
+    for code in codes:
+        if not 0 <= code < base:
+            raise ValueError(f"Code {code} outside [0, {base - 1}]")
+        value = value * base + code
+    return value
+
 
 
 def emit_signal(codec, digit, is_toy, write_valid, write_invalid, submission_file="submission.csv",
@@ -196,6 +237,7 @@ def run_probe(codec, index, mode, adapter_source, submission_file, started_at):
             raise TimeoutError("Runtime imports exceeded the computation allowance")
         signals.setitimer(signals.ITIMER_REAL, remaining)
         namespace = globals()
+        namespace["PROBE_CODEC"] = codec  # lets adapters size codes, e.g. LogScale(lo, hi, PROBE_CODEC.base)
         exec(compile(adapter_source, "adapter.py", "exec"), namespace)
         toy = bool(namespace["is_toy"]())
         digit = 0 if toy else codec.encode(namespace["quantity"](), mode)[index]

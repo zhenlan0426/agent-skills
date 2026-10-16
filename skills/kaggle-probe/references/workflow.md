@@ -8,6 +8,11 @@ Do not call the hooks at import time or overwrite runtime helpers (`Codec`,
 `emit_signal`, `run_probe`, `wait_until`, `decimal`, `signals`, or `time`). Do not
 replace `SIGALRM` or `ITIMER_REAL`; the runtime reserves them on Kaggle/Linux.
 
+The adapter can use three runtime names: `PROBE_CODEC` (the run's `Codec`, e.g.
+`PROBE_CODEC.base`), `LogScale(lo, hi, levels)` (log-grid codes for a positive
+statistic, with `interval(code)` to invert), and `pack_digits(codes, base)`
+(most significant first) to pack several per-digit codes into one integer.
+
 | Hook | Behavior |
 | --- | --- |
 | `is_toy()` | Identify the visible/sample test; return a boolean. |
@@ -108,7 +113,10 @@ Do not count nonzero digits to determine the number of probes: an integer
 equal to `base**n` needs `n + 1` digits.
 
 Use authorized calibration submissions with a known digit/statistic, or
-existing measurements from the same environment. Validate the distinction
+existing measurements from the same environment. `prepare --calibrate
+outcome@bucket --mode integer --digits 1` (e.g. `valid:0@0`) emits that one
+signal regardless of the adapter's `quantity()` and records it in the manifest,
+so its residual is measured against the known bucket. Validate the distinction
 between all enabled channels. Historical Kaggle strings in the source utility
 included:
 
@@ -132,10 +140,36 @@ when exposed by the target interface, and preserve its provenance. If timing
 cannot be bounded below half a bucket, widen resolution or leave the digit
 undecoded. A single fixed offset cannot compensate for arbitrary queue delays.
 
-`decode` requires an explicit overhead estimate and tolerance, in seconds.
-Tolerance must be nonnegative and strictly less than half the bucket width.
-The corrected duration must be within tolerance of a configured bucket. No
-negative clamping or bucket wraparound is performed.
+### Timing noise budget
+
+Finish times jitter (queueing, scoring, polling, possibly deliberate noise), so
+bucket width and tolerance come from residuals measured on earlier watched runs
+(`scripts/probe_noise.py`). A residual is elapsed − allowance − bucket target,
+bracketed by the last pending and first terminal poll. Runs are pooled per
+hardware (`enable_gpu` in the first kernel's metadata), because GPU kernels may
+start or queue differently. Per pool:
+
+- overhead = centre of the pooled residual range;
+- tolerance = `NOISE_MULTIPLIER` (3) × spread, at least `TOLERANCE_FLOOR_SECONDS`
+  (200 s) until the pool has `MIN_TIMING_DIGITS` (10);
+- narrowest safe bucket = `BUCKETS_PER_TOLERANCE` (4) × tolerance.
+
+A residual beyond the tolerance leaves its digit undecodable; a silent misread
+into the next bucket needs an error of at least bucket − tolerance = 3 ×
+tolerance, at least 9 × the measured spread. `prepare --noise-runs RUN...`
+refuses narrower buckets, and refuses a non-calibration run when the pool has
+no measured digit; `--gpu` selects the GPU pool and metadata. `probe.py noise
+--runs RUN...` prints residuals and both budgets. Each run directory must keep
+the watcher output in `watch/` (`watch --output RUN/watch`).
+
+`decode` takes `--overhead-seconds` and `--tolerance-seconds`, or derives them
+from `--noise-runs` (the decoded run itself is excluded, so a noisy digit cannot
+widen the tolerance that judges it). Tolerance must be nonnegative and strictly
+less than half the bucket width. The corrected duration must be within
+tolerance of a configured bucket; no negative clamping or wraparound. Without
+`--partial` the decode is all-or-nothing. With `--partial` it returns one row
+per observed digit (digit or error, plus a `note` for a digit beyond the
+measured residual range) and the value only when every digit decoded.
 
 ## Upload and submit exact versions
 
@@ -225,9 +259,11 @@ nonoverlapping score ranges in `valid_rules`, for example:
 ```
 
 Combine these with `error_rules` in the same file. The ranges are illustrative;
-they must distinguish actual outcomes for the target competition. In Name That
-LLM, constant predictions for different labels all score `1/18` if all 18 classes
-are present, so those files cannot populate different ranges.
+they must distinguish actual outcomes for the target competition. Under a
+class-balanced metric, constant predictions for different labels all score the
+same, so they cannot populate different ranges. Rerunning public notebooks with
+known public scores can: see [known-scores.md](known-scores.md), whose
+`known_scores.py rules` builds these windows.
 
 ```bash
 python "$SKILL_DIR/scripts/probe.py" watch \

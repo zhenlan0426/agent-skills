@@ -26,7 +26,10 @@ identify the visible/toy test run. Use the relevant competition rules when
 choosing a probe. Do not assume another competition's schema, runtime, or quota.
 
 Read [references/workflow.md](references/workflow.md) for adapter hooks,
-calibration, transport, and watcher configuration. Work in a new project-local
+calibration, the timing noise budget, transport, and watcher configuration.
+[references/kaggle-platform.md](references/kaggle-platform.md) lists measured
+Kaggle behavior; [references/known-scores.md](references/known-scores.md)
+covers extra valid outcomes from public notebooks with known scores. Work in a new project-local
 run directory. Keep the installed skill reusable; put competition-specific
 adapters, generated scripts, metadata, and observations in the project.
 
@@ -38,7 +41,7 @@ python "$SKILL_DIR/scripts/probe.py" prepare \
   --competition "$COMPETITION" --kernel "$KAGGLE_USER/$PROBE_SLUG" \
   --adapter adapter.py --output probe-run \
   --mode fraction --total-hours 4 --resolution-hours 0.5 --digits 5 \
-  --runtime-limit-hours "$RUNTIME_LIMIT_HOURS"
+  --runtime-limit-hours "$RUNTIME_LIMIT_HOURS" --noise-runs calib-run [more watched runs]
 python "$SKILL_DIR/scripts/probe.py" encode \
   --manifest probe-run/manifest.json --value 0.333333333333333333
 ```
@@ -60,11 +63,19 @@ the remaining wait rather than shifting the deadline.
 Choose a window below the competition cap to leave startup, shutdown, and
 platform margin. Optional `--runtime-limit-hours` rejects windows above the cap.
 
+Bucket width is bounded by measured timing noise. `--noise-runs` names earlier
+watched run directories; their residuals on the same hardware (`--gpu` selects
+the GPU pool) set a tolerance and a minimum bucket, and `prepare` refuses
+narrower buckets or a pool with no measurements. The first run on new hardware
+is therefore a calibration: `--calibrate outcome@bucket --mode integer
+--digits 1` (e.g. `valid:0@0`) emits that known signal. `probe.py noise --runs
+...` shows the budgets.
+
 `prepare` only writes local files: a manifest and a standalone script plus
 private Kaggle metadata per digit, with suffixes `-00`, `-01`, etc. Each script
 embeds its runtime and adapter; no skill installation is needed on Kaggle.
-Setup prints that GPU and internet are disabled in the metadata. Update required
-datasets, accelerator, or competition settings before uploading. Schema-1
+Internet is disabled and GPU follows `--gpu`. Update required datasets or
+competition settings before uploading. Schema-1
 manifests use the old mapping and are rejected; prepare a new run.
 
 ## Run and decode
@@ -73,9 +84,10 @@ Develop and test the adapter locally with synthetic inputs first. Test the toy
 branch: it must write a valid submission without sleeping or computing the
 hidden quantity. Ensure the quantity is deterministic and identical across
 reruns. Extra valid outcomes count only if their observable scores distinguish
-them. For Name That LLM, any constant-class prediction has balanced accuracy
-`1/18` when all 18 classes occur in the scored split; changing the constant
-label does not create another distinguishable valid outcome.
+them. Under a class-balanced metric every constant prediction scores the
+same, so changing the constant label does not create another valid outcome;
+rerunning public notebooks with known, separated scores does (see
+known-scores.md).
 
 Use the reference procedure to save exact notebook versions and submit with
 manifest descriptions. Honor existing authorization: building this skill or
@@ -85,8 +97,8 @@ unexplained failure or ambiguous acceptance; inspect remote state before a
 retry that might create a duplicate.
 
 Calibrate timing overhead and outcome signatures for the target competition.
-Do not reuse the historical 217-second correction or infer success from an
-unrecognized error. Fixed deadlines remove computation-time variation while
+Do not reuse the historical 217-second correction, guess a tolerance, or infer
+success from an unrecognized error. Fixed deadlines remove computation-time variation while
 preparation fits its allowance; queueing, scoring, shutdown, and polling still
 require bounded uncertainty within the bucket tolerance.
 
@@ -99,8 +111,12 @@ The watcher is read-only, resumable, and requires a deadline.
 ```bash
 python "$SKILL_DIR/scripts/probe.py" decode \
   --manifest probe-run/manifest.json --observations probe-run/watch/observations.json \
-  --overhead-seconds "$MEASURED_OVERHEAD" --tolerance-seconds "$TIMING_TOLERANCE"
+  --noise-runs calib-run [other watched runs] [--partial]
 ```
+
+Overhead and tolerance come from the other runs' noise budget (or pass
+`--overhead-seconds` and `--tolerance-seconds`). `--partial` decodes each
+observed digit separately, so results are usable before the run finishes.
 
 The decoder requires every index exactly once, matches unique descriptions,
 and rejects reserved crash signals, unresolved watcher issues, unknown outcomes,
