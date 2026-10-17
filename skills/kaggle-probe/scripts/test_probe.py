@@ -12,7 +12,7 @@ import time
 import unittest
 
 from probe import decode_observations
-from probe_runtime import Codec, emit_signal
+from probe_runtime import Codec, SqrtScale, dataset_dir, emit_signal, pack_slots, unpack_slots
 
 
 @contextmanager
@@ -162,6 +162,35 @@ def write_invalid_submission(): raise AssertionError("unexpected writer")
             self.assertEqual(output.read_text(), "valid:0")
             self.assertEqual(waits, [])
 
+    def test_sqrt_scale_intervals_cover_every_count(self):
+        scale = SqrtScale(15)
+        self.assertEqual([scale.code(c) for c in (0, 1, 2, 4, 45, 46, 10**6)], [0, 2, 3, 4, 13, 14, 14])
+        for count in range(200):
+            lower, upper = scale.interval(scale.code(count))
+            self.assertTrue(lower <= count <= upper)
+        self.assertEqual(scale.interval(14), (46, float("inf")))
+        with self.assertRaisesRegex(ValueError, "never emitted"):
+            scale.interval(1)
+
+    def test_slots_round_trip_and_reject_overflow(self):
+        radices = [15, 4, 3]
+        seen = {pack_slots([a, b, c], radices) for a in range(15) for b in range(4) for c in range(3)}
+        self.assertEqual(seen, set(range(180)))
+        self.assertEqual(unpack_slots(pack_slots([14, 2, 1], radices), radices), [14, 2, 1])
+        with self.assertRaises(ValueError):
+            pack_slots([15, 0, 0], radices)
+        with self.assertRaises(ValueError):
+            unpack_slots(180, radices)
+
+    def test_dataset_dir_override_and_absence(self):
+        with tempfile.TemporaryDirectory() as folder:
+            os.environ["PROBE_DATASETS"] = json.dumps({"owner/data": folder})
+            try:
+                self.assertEqual(dataset_dir("owner/data/3"), Path(folder))
+                self.assertIsNone(dataset_dir("owner/not-attached-anywhere-xyz"))
+            finally:
+                os.environ.pop("PROBE_DATASETS")
+
     def test_prepared_script_runs_standalone_and_decoder_orders_indices(self):
         script = Path(__file__).with_name("probe.py")
         with tempfile.TemporaryDirectory() as folder:
@@ -201,12 +230,16 @@ def write_invalid_submission():
             gpu = subprocess.run(base + ["--output", str(run), "--digits", "2", "--gpu", "--noise-runs", str(calib)],
                                  capture_output=True, text=True)
             self.assertIn("No measured timing for GPU", gpu.stderr)
-            subprocess.run(base + ["--output", str(run), "--digits", "2", "--noise-runs", str(calib)],
-                           check=True, capture_output=True, text=True)
+            unpinned = subprocess.run(base + ["--output", str(run), "--digits", "2", "--noise-runs", str(calib),
+                                              "--dataset", "owner/data"], capture_output=True, text=True)
+            self.assertIn("owner/slug/version", unpinned.stderr)
+            subprocess.run(base + ["--output", str(run), "--digits", "2", "--noise-runs", str(calib),
+                                   "--dataset", "owner/data/3"], check=True, capture_output=True, text=True)
             manifest = json.loads((run / "manifest.json").read_text())
             for entry in manifest["probes"]:
                 metadata = json.loads((run / entry["folder"] / "kernel-metadata.json").read_text())
                 self.assertEqual(metadata["title"], metadata["id"].split("/")[1])
+                self.assertEqual(metadata["dataset_sources"], ["owner/data/3"])
             codec = Codec(**manifest["codec"])
             observations = []
             for entry, digit in zip(manifest["probes"], [2, 9]):

@@ -24,6 +24,9 @@ def prepare(args):
     # Kaggle derives the slug from the title, so the slug must already be in slugified form.
     if not re.fullmatch(r"[\w-]+/[a-z0-9]{2,}(-[a-z0-9]+)*", args.kernel):
         raise ValueError("Kernel must be owner/slug, with a lowercase hyphenated slug of 2+ characters")
+    for ref in args.dataset:
+        if not re.fullmatch(r"[\w-]+/[\w.-]+/\d+", ref):
+            raise ValueError(f"--dataset {ref}: use owner/slug/version so every rerun reads the same files")
     if args.calibrate and (args.mode, args.digits) != ("integer", 1):
         raise ValueError("--calibrate needs --mode integer --digits 1")
     codec = Codec(args.total_hours, args.resolution_hours, args.digits, args.valid_outcomes, args.allowance_hours)
@@ -56,7 +59,8 @@ def prepare(args):
             "id": kernel, "title": kernel.split("/")[1],
             "code_file": "probe.py", "language": "python", "kernel_type": "script",
             "is_private": True, "enable_gpu": args.gpu, "enable_internet": False,
-            "competition_sources": [args.competition], "dataset_sources": [], "kernel_sources": [],
+            "competition_sources": [args.competition], "dataset_sources": sorted(set(args.dataset)),
+            "kernel_sources": [],
         }
         entrypoint = f'''
 if __name__ == "__main__":
@@ -188,6 +192,8 @@ def main():
     prep.add_argument("--gpu", action="store_true", help="Enable a GPU in the kernel metadata (separate noise pool)")
     prep.add_argument("--noise-runs", nargs="+", default=[],
                       help="Watched run directories whose residuals set the timing budget; required unless --calibrate")
+    prep.add_argument("--dataset", action="append", default=[],
+                      help="owner/slug/version to attach to every digit; the adapter finds it with dataset_dir()")
     prep.add_argument("--calibrate", help="Emit one known signal, e.g. valid:0@0, instead of the adapter's quantity")
     noise_parser = sub.add_parser("noise", help="Timing residuals and CPU/GPU noise budgets of watched runs")
     noise_parser.add_argument("--runs", nargs="+", required=True)

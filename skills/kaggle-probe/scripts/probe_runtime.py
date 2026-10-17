@@ -165,14 +165,73 @@ class LogScale:
         return lower, upper
 
 
+class SqrtScale:
+    """Map a count to code round(2 sqrt(count)), capped at levels - 1: each step is about one Poisson SD wide.
+
+    Code 1 is never emitted (count 0 -> 0, count 1 -> 2).
+    """
+
+    def __init__(self, levels):
+        self.levels = int(levels)
+
+    def code(self, count):
+        return min(math.floor(2 * math.sqrt(count) + 0.5), self.levels - 1)
+
+    def interval(self, code):
+        """Inclusive count range that encodes to `code`; the top code is open-ended (upper = inf)."""
+        if code == 0:
+            return 0, 0
+        lower = math.ceil((code - 0.5) ** 2 / 4)
+        upper = math.inf if code == self.levels - 1 else math.ceil((code + 0.5) ** 2 / 4) - 1
+        if upper < lower:
+            raise ValueError(f"Code {code} is never emitted")
+        return lower, upper
+
+
+def pack_slots(codes, radices):
+    """Mixed-radix packing of several small codes into one digit (first slot most significant)."""
+    if len(codes) != len(radices):
+        raise ValueError("Need one radix per code")
+    value = 0
+    for code, radix in zip(codes, radices):
+        if not 0 <= code < radix:
+            raise ValueError(f"Code {code} outside [0, {radix - 1}]")
+        value = value * radix + code
+    return value
+
+
+def unpack_slots(value, radices):
+    """Inverse of pack_slots."""
+    codes = []
+    for radix in reversed(radices):
+        value, code = divmod(value, radix)
+        codes.append(code)
+    if value:
+        raise ValueError("Value exceeds the product of the radices")
+    return codes[::-1]
+
+
 def pack_digits(codes, base):
     """Combine per-probe codes (most significant first) into one integer for `--mode integer`."""
-    value = 0
-    for code in codes:
-        if not 0 <= code < base:
-            raise ValueError(f"Code {code} outside [0, {base - 1}]")
-        value = value * base + code
-    return value
+    return pack_slots(codes, [base] * len(codes))
+
+
+def dataset_dir(ref):
+    """Mount folder of a dataset attached with `prepare --dataset owner/slug/version`, or None if absent.
+
+    `PROBE_DATASETS` (JSON {"owner/slug": dir}) overrides it for local simulation.
+    """
+    import json
+    import os
+    owner, slug = ref.split("/")[:2]
+    local = json.loads(os.environ.get("PROBE_DATASETS", "{}"))
+    if f"{owner}/{slug}" in local:
+        return Path(local[f"{owner}/{slug}"])
+    root = Path("/kaggle/input")
+    for path in (root / "datasets" / owner / slug, root / slug):
+        if path.is_dir():
+            return path
+    return next((path for path in sorted(root.rglob(slug)) if path.is_dir()), None)
 
 
 
