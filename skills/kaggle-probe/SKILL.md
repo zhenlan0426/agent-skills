@@ -74,8 +74,9 @@ is therefore a calibration: `--calibrate outcome@bucket --mode integer
 `prepare` only writes local files: a manifest and a standalone script plus
 private Kaggle metadata per digit, with suffixes `-00`, `-01`, etc. Each script
 embeds its runtime and adapter; no skill installation is needed on Kaggle.
-Internet is disabled and GPU follows `--gpu`. Update required datasets or
-competition settings before uploading. Schema-1
+Internet is disabled and GPU follows `--gpu`. Attach each Kaggle dataset the
+quantity reads with `--dataset owner/slug/version` (pinned, so every rerun reads
+the same files); the adapter finds its mount with `dataset_dir('owner/slug')`. Schema-1
 manifests use the old mapping and are rejected; prepare a new run.
 
 ## Run and decode

@@ -8,10 +8,19 @@ Do not call the hooks at import time or overwrite runtime helpers (`Codec`,
 `emit_signal`, `run_probe`, `wait_until`, `decimal`, `signals`, or `time`). Do not
 replace `SIGALRM` or `ITIMER_REAL`; the runtime reserves them on Kaggle/Linux.
 
-The adapter can use three runtime names: `PROBE_CODEC` (the run's `Codec`, e.g.
-`PROBE_CODEC.base`), `LogScale(lo, hi, levels)` (log-grid codes for a positive
-statistic, with `interval(code)` to invert), and `pack_digits(codes, base)`
-(most significant first) to pack several per-digit codes into one integer.
+The adapter can use these runtime names:
+
+| Name | Use |
+| --- | --- |
+| `PROBE_CODEC` | The run's `Codec`, e.g. `PROBE_CODEC.base`. |
+| `LogScale(lo, hi, levels)` | Log-grid code for a positive statistic; `interval(code)` inverts it. |
+| `SqrtScale(levels)` | Count code `round(2 sqrt(c))`, capped at `levels - 1`: each step is about one Poisson SD, so rare-event counts get fine codes near zero and coarse ones where noise is large. `interval(code)` gives the inclusive count range (top code open-ended). |
+| `pack_slots(codes, radices)` / `unpack_slots(value, radices)` | Mixed-radix packing of several small codes into one digit (first slot most significant), e.g. a 15-level count × a 14-level count in a base-216 digit. |
+| `pack_digits(codes, base)` | Per-digit codes (most significant first) into one integer for `--mode integer`. |
+| `dataset_dir('owner/slug')` | Mount folder of a dataset attached with `prepare --dataset`, or `None`. Tries `/kaggle/input/datasets/<owner>/<slug>`, then `/kaggle/input/<slug>`, then a search. Env `PROBE_DATASETS` (JSON `{"owner/slug": dir}`) overrides it for local simulation. |
+
+A module-level `print(dataset_dir(...))` in the adapter runs in the toy save-run too, so its log confirms the mount
+before any submission is spent; raise only inside `quantity()`, where a failure lands in the reserved crash slot.
 
 | Hook | Behavior |
 | --- | --- |
@@ -272,7 +281,10 @@ python "$SKILL_DIR/scripts/probe.py" watch \
 ```
 
 Start immediately after submission acceptance, preferably while submissions
-are still pending. Choose the deadline to cover the configured runtime plus
+are still pending, and detach it from the agent or terminal session
+(`setsid nohup python ... watch ... > watch.log 2>&1 < /dev/null &`): a watcher
+that is not polling when a digit turns terminal loses that digit's timing,
+because there is no duration field to recover it from. Choose the deadline to cover the configured runtime plus
 queue margin. Poll intervals must be in `(0, 60]` seconds. `--page-size` defaults
 to 100 and `--max-pages` to 20. The summary reports whether pagination exhausted
 the list; increase the bound if targets may be beyond the scanned pages. Each
