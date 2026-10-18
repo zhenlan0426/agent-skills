@@ -146,6 +146,48 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(result["missing_indices"], [1])
             self.assertEqual(result["undecodable_indices"], [0])
 
+    def test_transient_fetch_errors_back_off_and_resume(self):
+        class HTTPError(Exception):
+            def __init__(self, status):
+                super().__init__(f"{status} Client Error")
+                self.response = SimpleNamespace(status_code=status)
+
+        class FlakySource(FakeSource):
+            def fetch(self, *args):
+                item = next(self.batches)
+                if isinstance(item, Exception):
+                    raise item
+                return {"submissions": item, "pagination_exhausted": True}
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            probes = [{"index": 0, "description": "kaggle-probe:test:0"}]
+            manifest = {"schema_version": 2, "run_id": "test", "competition": "example",
+                        "codec": asdict(Codec(digits=1)), "probes": probes}
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            (root / "mapping.json").write_text(json.dumps(MAPPING))
+            args = SimpleNamespace(manifest=root / "manifest.json", mapping=root / "mapping.json",
+                                   output=root / "watch", poll_seconds=20, timeout_seconds=1000,
+                                   page_size=100, max_pages=2)
+            clock = FakeClock()
+            terminal = [submission(0, "ERROR", errorDescription="expected submission file")]
+            with patch("sys.stderr"):
+                result = watch_run(args, source=FlakySource([[submission(0)], HTTPError(429), HTTPError(503),
+                                                             terminal]),
+                                   now=clock.now, clock=lambda: clock.seconds, sleep=clock.sleep)
+            self.assertEqual(result["terminal_count"], 1)
+            # 20 s poll, then 40 s and 80 s backoffs before the terminal poll.
+            self.assertEqual(clock.seconds, 1790 + 20 + 40 + 80)
+            with self.assertRaisesRegex(HTTPError, "403"):
+                watch_run(SimpleNamespace(**{**vars(args), "output": root / "other"}),
+                          source=FlakySource([HTTPError(403)]), now=clock.now,
+                          clock=lambda: clock.seconds, sleep=clock.sleep)
+            with patch("sys.stderr"):
+                result = watch_run(SimpleNamespace(**{**vars(args), "output": root / "dead", "timeout_seconds": 50}),
+                                   source=FlakySource([HTTPError(429)] * 5), now=clock.now,
+                                   clock=lambda: clock.seconds, sleep=clock.sleep)
+            self.assertEqual(result["missing_indices"], [0])
+
     def test_duplicates_and_changed_refs_are_rejected(self):
         probes = [{"index": 0, "description": "kaggle-probe:test:0"}]
         with self.assertRaisesRegex(ValueError, "Multiple submissions"):

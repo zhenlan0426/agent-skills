@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
 import time
 import uuid
 
@@ -15,6 +16,15 @@ from probe_runtime import decimal
 PENDING = {"PENDING", "QUEUED", "RUNNING", "SUBMITTED"}
 TERMINAL = {"COMPLETE", "ERROR", "CANCELLED", "CANCELED", "TIMEOUT", "TIMED_OUT"}
 TIMING_ISSUES = ("Already terminal on first observation", "Cannot establish elapsed time")
+MAX_BACKOFF_SECONDS = 120
+
+
+def is_transient(exc):
+    """Rate limits, server errors, and dropped connections; a skipped read-only poll only widens a timing interval."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is not None:
+        return status == 429 or status >= 500
+    return type(exc).__name__ in {"ConnectionError", "Timeout", "ReadTimeout", "ConnectTimeout"}
 
 
 def timestamp(value):
@@ -200,6 +210,15 @@ def update_records(state, raw_rows, probes, now, mapping, codec, pending_at=None
         record["observation"] = row
 
 
+def sorted_observations(state):
+    return sorted((r["observation"] for r in state["records"].values() if "observation" in r),
+                  key=lambda r: r["index"])
+
+
+def terminal_indices(state):
+    return {int(i) for i, r in state["records"].items() if r.get("terminal")}
+
+
 def watch_run(args, *, source=None, now=None, clock=time.monotonic, sleep=time.sleep):
     from probe import load_manifest
     manifest, codec = load_manifest(args.manifest)
@@ -229,24 +248,37 @@ def watch_run(args, *, source=None, now=None, clock=time.monotonic, sleep=time.s
     source = source or KaggleSource()
     deadline = clock() + args.timeout_seconds
     descriptions = {p["description"] for p in probes}
+    failures, snapshot = 0, {"pagination_exhausted": False}
     while True:
         poll_started_at = now()
-        snapshot = source.fetch(manifest["competition"], descriptions, args.page_size, args.max_pages)
+        try:
+            snapshot = source.fetch(manifest["competition"], descriptions, args.page_size, args.max_pages)
+        except Exception as exc:
+            if not is_transient(exc):
+                raise
+            failures += 1
+            remaining = deadline - clock()
+            if remaining <= 0:
+                break
+            wait = min(args.poll_seconds * 2 ** failures, MAX_BACKOFF_SECONDS, remaining)
+            print(f"{poll_started_at.isoformat()} transient fetch error, retrying in {wait:.0f} s: {exc}",
+                  file=sys.stderr, flush=True)
+            sleep(wait)
+            continue
+        failures = 0
         observed_at = now()
         # Persist the raw response before matching, timing, or classification.
         write_json(snapshots / f"{uuid.uuid4().hex}.json",
                    {"poll_started_at": poll_started_at.isoformat(),
                     "observed_at": observed_at.isoformat(), **snapshot})
         update_records(state, snapshot["submissions"], probes, observed_at, mapping, codec, poll_started_at)
-        observations = [r["observation"] for r in state["records"].values() if "observation" in r]
-        observations.sort(key=lambda r: r["index"])
         write_json(state_path, state)
-        write_json(output / "observations.json", observations)
-        terminal = {int(i) for i, r in state["records"].items() if r.get("terminal")}
+        write_json(output / "observations.json", sorted_observations(state))
         remaining = deadline - clock()
-        if len(terminal) == codec.digits or remaining <= 0:
+        if len(terminal_indices(state)) == codec.digits or remaining <= 0:
             break
         sleep(min(args.poll_seconds, remaining))
+    observations, terminal = sorted_observations(state), terminal_indices(state)
     return {"observations": str(output / "observations.json"),
             "terminal_count": len(terminal), "submission_count": codec.digits,
             "undecodable_indices": [r["index"] for r in observations if r.get("issues")],

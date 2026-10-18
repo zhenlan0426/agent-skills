@@ -292,8 +292,11 @@ poll fetches details only for matching descriptions, refuses multiple refs for
 one description, saves the matched raw response dictionaries under
 `watch/snapshots/`, and writes `watch/state.json` and `watch/observations.json`.
 On deadline it preserves partial results and reports missing/undecodable indices.
-On transport errors or identity ambiguity it stops; inspect the saved evidence
-before resuming. It does not retry or create submissions.
+A transient transport error (HTTP 429, 5xx, or a dropped connection) skips that
+poll and retries after a doubling backoff capped at 120 s, which only widens the
+affected digit's polling interval; any other transport error or identity
+ambiguity stops it, so inspect the saved evidence before resuming. It never
+creates submissions.
 
 Run the same command to resume the same manifest and mapping. State preserves
 the last pending timestamp and first terminal timing rather than measuring a
