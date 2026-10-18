@@ -154,7 +154,9 @@ undecoded. A single fixed offset cannot compensate for arbitrary queue delays.
 Finish times jitter (queueing, scoring, polling, possibly deliberate noise), so
 bucket width and tolerance come from residuals measured on earlier watched runs
 (`scripts/probe_noise.py`). A residual is elapsed − allowance − bucket target,
-bracketed by the last pending and first terminal poll. Runs are pooled per
+bracketed by the last pending and first terminal poll; a digit whose polling
+gap is half a bucket or more (a watcher outage) is left out, since it cannot
+place its bucket. Runs are pooled per
 hardware (`enable_gpu` in the first kernel's metadata), because GPU kernels may
 start or queue differently. Per pool:
 
