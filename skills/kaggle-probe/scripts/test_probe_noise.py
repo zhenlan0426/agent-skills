@@ -1,6 +1,9 @@
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
-from probe_noise import timing_budget, MIN_TIMING_DIGITS
+from probe_noise import observed_timing, timing_budget, MIN_TIMING_DIGITS
 from probe_runtime import Codec, LogScale, pack_digits
 
 
@@ -16,6 +19,19 @@ class NoiseTests(unittest.TestCase):
         self.assertEqual(timing_budget(noisy, False)["tolerance_seconds"], 426)
         self.assertEqual(timing_budget([], True), {"gpu": True, "digits": 0, "tolerance_seconds": 200,
                                                    "min_resolution_seconds": 800})
+
+    def test_polling_gap_of_half_a_bucket_measures_no_noise(self):
+        with tempfile.TemporaryDirectory() as run:
+            codec = {"total_hours": "8", "resolution_hours": "0.25", "digits": 1, "valid_outcomes": 1,
+                     "allowance_hours": "0.5"}
+            Path(run, "manifest.json").write_text(json.dumps({"codec": codec}))
+            Path(run, "watch").mkdir()
+            Path(run, "watch", "observations.json").write_text(json.dumps([
+                {"index": 0, "elapsed_lower_seconds": "2724.3", "elapsed_seconds": "2740.9"},
+                {"index": 1, "elapsed_lower_seconds": "1507.5", "elapsed_seconds": "11910.9"}]))
+            _, _, rows = observed_timing(run)
+        self.assertEqual((rows[0]["bucket"], round(rows[0]["residual_upper"], 1)), (1, 40.9))
+        self.assertNotIn("bucket", rows[1])
 
     def test_calibration_digit_round_trips_and_refuses_reserved_crash_slot(self):
         codec = Codec("8", "0.5", 1, 3)

@@ -38,14 +38,17 @@ def observed_timing(run):
     for row in observations:
         if row.get("elapsed_seconds") is None:
             continue
+        lower = Decimal(str(row.get("elapsed_lower_seconds", row["elapsed_seconds"])))
+        # A polling gap of half a bucket or more (a watcher outage) cannot place the digit, so it measures no noise.
+        if Decimal(str(row["elapsed_seconds"])) - lower >= codec.step_seconds / 2:
+            continue
         upper = Decimal(str(row["elapsed_seconds"])) - codec.allowance_seconds
         # A calibration knows its bucket, so even a residual past half a bucket is measured, not wrapped.
         bucket = (codec.signal(codec.calibration_digit(calibrate))["bucket"] if calibrate
                   else int((upper / codec.step_seconds).to_integral_value()))
-        lower = row.get("elapsed_lower_seconds", row["elapsed_seconds"])
         row["bucket"] = bucket
         row["residual_upper"] = float(upper - bucket * codec.step_seconds)
-        row["residual_lower"] = float(Decimal(str(lower)) - codec.target_seconds(bucket))
+        row["residual_lower"] = float(lower - codec.target_seconds(bucket))
     return manifest, codec, observations
 
 
