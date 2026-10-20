@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 RESULTS_ENV = "KAGGLE_LLM_RESULTS"
 DEFAULT_RESULTS = "/kaggle/working/kaggle_llm_results.jsonl"
 PROBE_MESSAGES = [{"role": "user", "content": "Reply with OK."}]
-PROBE_MAX_TOKENS = 256
+PROBE_MAX_TOKENS = 4096  # Room for default reasoning before "OK"; a cut-off probe skips the model.
 
 
 class CallError(Exception):

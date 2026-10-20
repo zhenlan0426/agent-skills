@@ -126,7 +126,7 @@ def select(client, *, refresh=False):
     unavailable = []
     for model in candidates:
         try:
-            raw = client.chat(PROBE_MESSAGES, model=model, max_tokens=256)
+            raw = client.chat(PROBE_MESSAGES, model=model, max_tokens=4096)
         except KaggleLLMError as exc:
             if exc.status in UNAVAILABLE:
                 unavailable.append(model)

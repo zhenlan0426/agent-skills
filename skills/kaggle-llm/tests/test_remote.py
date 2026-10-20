@@ -239,7 +239,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(job['probe'], [{'model': TOP, 'status': 404}, {'model': OPUS, 'status': 200}])
         probe_payload = call.calls[0][2]
         self.assertEqual(probe_payload['messages'], remote_runner.PROBE_MESSAGES)
-        self.assertEqual(probe_payload['max_tokens'], 256)
+        self.assertEqual(probe_payload['max_tokens'], 4096)
         self.assertEqual({model for model, _, _ in call.calls[2:]}, {OPUS})
         rows = self.kind(lines, 'row')
         self.assertEqual(sorted(row['line'] for row in rows), [1, 2, 3])

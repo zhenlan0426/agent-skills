@@ -154,7 +154,7 @@ each line under a lock:
    `{"kind":"heartbeat","elapsed"}` every `heartbeat_seconds` until
    `sleep_seconds`, then write `end{stopped_reason:"dry_run"}`. The job line has
    `model: null` and the correct `row_count`. (This is used by experiments E1/E2.)
-4. **Probe.** Try candidates in order with `PROBE_MESSAGES` and `max_tokens: 256`.
+4. **Probe.** Try candidates in order with `PROBE_MESSAGES` and `max_tokens: 4096` (room for default reasoning).
    - Success: pin that model and record probe status 200.
    - Retryable failure (status 429, ≥ 500, or `None`; 403 is **not** retryable in the probe): retry up to
      `max_attempts` with backoff, then move to the next candidate.
