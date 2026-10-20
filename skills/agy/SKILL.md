@@ -37,27 +37,25 @@ or anything where you'd otherwise make one or two calls total.
 ## Invocation
 
 ```bash
-agy -p "<prompt>" --model gemini-3.7-flash-high
+agy -p "<prompt>" --model gemini-3.8-flash-high
 ```
 
 Never leave `--model` unset; the built-in default is not this one.
 
 - Reasoning effort is **baked into the model id** (`-high`), so `--effort` is
   redundant and should be omitted.
-- Use the **newest Flash version that passes the eval set** (18/18, see
-  `../kaggle-llm/eval/README.md`), not the "Pro" tier. `gemini-3.1-pro-high` is
-  an older version and zhenlan judges it worse than 3.7 Flash — Pro is not an
-  upgrade path.
+- Default is `gemini-3.8-flash-high` (zhenlan's choice, 2026-10-20, after
+  `gemini-3.7-flash-high` left `agy models`; 3.1 Pro is gone too). On the eval
+  set (`../kaggle-llm/eval/README.md`) it scored 17/18 and ran about 2x slower
+  than 3.7 Flash; the miss was empty output on a code-writing task (see the
+  `structured_output` gotcha below).
 - When `agy models` lists a newer Gemini, run the eval on it before switching.
-  As of 2026-09-27, `gemini-3.8-flash-high` is newer but failed (empty output on
-  a code-writing task, 3 of 3 times) and was about 2x slower, so the default
-  stays `gemini-3.7-flash-high`.
 
 ## Structured output — the usual shape for batch work
 
 ```bash
 agy -p "<prompt with the source text inlined>" \
-    --model gemini-3.7-flash-high \
+    --model gemini-3.8-flash-high \
     --output-format json \
     --json-schema <schema-file-or-string>
 ```
