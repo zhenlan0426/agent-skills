@@ -5,8 +5,9 @@ Wraps the patterns that were verified against colab-cli 0.7.4:
   * a job runs as a subprocess inside ONE blocking kernel cell, so the kernel
     stays busy (Colab keeps busy runtimes alive) and the job survives the local
     client disconnecting;
-  * the local `colab exec` client is detached once the job has started (it
-    busy-waits a full CPU core otherwise);
+  * the local `colab exec` client stays attached for the whole job (it
+    busy-waits a CPU core): two G4 VMs with a detached client vanished ~25 min
+    into their jobs (2026-10-31), and the attached rerun survived for hours;
   * progress is read by downloading the VM-side log (the Contents API works
     while the kernel is busy; a second `colab exec` would queue behind the job).
 
@@ -331,9 +332,10 @@ def cmd_up(a):
         die(f"could not allocate {gpu}; it may be unavailable right now or not "
             "in this plan. Ask the user before trying a different GPU.", r.returncode)
     job_file(a.session).unlink(missing_ok=True)  # a fresh VM has no jobs
-    exec_py(a.session, "import subprocess\nprint(subprocess.run(['nvidia-smi',"
-            "'--query-gpu=name,memory.total','--format=csv,noheader'],"
-            "capture_output=True,text=True).stdout or 'no GPU')", timeout="120")
+    exec_py(a.session, "import shutil, subprocess\nprint(shutil.which('nvidia-smi') and "
+            "subprocess.run(['nvidia-smi','--query-gpu=name,memory.total',"
+            "'--format=csv,noheader'],capture_output=True,text=True).stdout or 'no GPU')",
+            timeout="120")
     colab("usage")
 
 
@@ -369,13 +371,26 @@ def cmd_push(a):
             colab("rm", "-s", a.session, remote_tgz, capture=True, check=False)
 
 
+def upload_part(session, local, remote, tries=3, timeout=180):
+    """One `colab upload` with a deadline: a 40MB part takes ~6s, but one hung
+    for 25 min without an error (2026-10-31), and a retry then took seconds."""
+    for attempt in range(1, tries + 1):
+        try:
+            colab("upload", "-s", session, str(local), remote, capture=True, timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            print(f"[cgpu]   upload stalled for {timeout}s (attempt {attempt}/{tries}); retrying",
+                  file=sys.stderr)
+    die(f"upload of {local} kept stalling; check `cgpu ls` and retry")
+
+
 def upload(session, local, remote):
     """`colab upload`, split into parts: the runtime proxy drops uploads
     somewhere between 50 and 100 MB (downloads have no such limit)."""
     size = local.stat().st_size
     print(f"[cgpu] uploading {local.name} ({size / 1e6:.1f} MB, ~7 MB/s) -> {remote}")
     if size <= CHUNK:
-        colab("upload", "-s", session, str(local), remote, capture=True)
+        upload_part(session, local, remote)
         return
     parts = []
     try:
@@ -385,7 +400,7 @@ def upload(session, local, remote):
                 part.write_bytes(chunk)
                 rpart = f"/tmp/cgpu-part-{uuid.uuid4().hex[:8]}"
                 parts.append(rpart)
-                colab("upload", "-s", session, str(part), rpart, capture=True)
+                upload_part(session, part, rpart)
                 print(f"[cgpu]   {f.tell() / 1e6:.0f}/{size / 1e6:.0f} MB")
         exec_py(session, f"import os\nos.makedirs(os.path.dirname({remote!r}) or '.',"
                 f"exist_ok=True)\nwith open({remote!r},'wb') as out:\n"
@@ -542,9 +557,15 @@ _put('status.json', json.dumps(status))
                            f"see {client_log}")
                 break
             time.sleep(2)
-        client.terminate()  # the kernel cell keeps running without us
-        if failure and settle(a.session, job) == "cancelled":
-            die(failure + ". It was cancelled and will not run later")
+        if failure:
+            client.terminate()
+            if settle(a.session, job) == "cancelled":
+                die(failure + ". It was cancelled and will not run later")
+        else:
+            # Keep the client attached (its own session, so it outlives cgpu): Colab
+            # reclaimed VMs whose busy kernel had no client. It exits with the cell.
+            job["client_pid"] = client.pid
+            save_job(a.session, job)
     finally:
         os.unlink(f.name)
     st = job_status(a.session, job)
@@ -552,6 +573,19 @@ _put('status.json', json.dumps(status))
         die(f"job {jid}: {st['error']}", st["rc"])
     print(f"[cgpu] job {jid} started on '{a.session}': {command}")
     print(f"[cgpu] follow with: cgpu logs {a.session}   |   cgpu wait {a.session}")
+
+
+def client_alive(job):
+    pid = job.get("client_pid")
+    if pid is None:
+        return True  # started by a cgpu that detached its client: unknown
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
 
 
 def cmd_logs(a):
@@ -573,6 +607,11 @@ def cmd_logs(a):
         print("\n".join(lines[-a.n:]))
     kind, st = job_state(a.session, job)
     mins = (time.time() - job["started"]) / 60
+    if kind == "running" and not client_alive(job):
+        print(f"[cgpu] the local exec client for this job is gone (e.g. 'Connection was "
+              f"lost' or a restarted machine); Colab reclaimed VMs ~25 min after that. Get "
+              f"checkpoints off the VM now; see {STATE_DIR}/{a.session}-{job['id']}.client.log",
+              file=sys.stderr)
     print(f"[cgpu] job {job['id']}: " + {
         "finished": lambda: f"FINISHED exit={st['rc']}"
                             + (f" ({st['error']})" if st["error"] else ""),

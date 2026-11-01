@@ -25,7 +25,7 @@ there. For the second part, read the target's reference file:
 |---|---|---|---|
 | **Local 4090** | 24GB on one card; bf16, FlashAttention 2 | free | 1× |
 | **Kaggle T4 ×2** | 2 × 16GB separate cards; fp16 only (no bf16), no FlashAttention 2 | free; weekly quota that resets and expires unused; queue waits; runs capped at about 12h | several times slower |
-| **Colab G4** | 96GB on one card (RTX PRO 6000 Blackwell; bf16/fp8) | 8.90 CU/hr from a balance that expires at month end; observed charges suggest a ~15 min minimum per `up` (inferred) | faster |
+| **Colab G4** | 96GB on one card (RTX PRO 6000 Blackwell; bf16/fp8) | 8.90–10.05 CU/hr from a balance that expires at month end; observed charges suggest a ~15 min minimum per `up` (inferred); downloading results is billed VM time too | faster |
 
 Colab's A100 high-mem (6.77 CU/hr, VRAM unverified, hung once in testing), L4,
 and T4 are worse value than G4, the 4090, and Kaggle respectively. Use them
@@ -119,6 +119,10 @@ offline wheels for Kaggle.
   how to provide them on its platform.
 - Files on a remote VM are not durable. For long, valuable runs, get
   checkpoints off the VM while the job runs.
+- Bringing results home costs VM time (Colab: ≈ 6 MB/s). Plan small outputs
+  (adapters, not merged weights). Send big artifacts straight to their final
+  home, such as a Kaggle dataset at ≈ 80 MB/s
+  ([references/colab.md](references/colab.md#getting-large-results-off-the-vm)).
 - Don't resubmit unchanged after a failure you haven't diagnosed. On Colab,
   every re-allocation costs compute units again.
 - Report where the job ran and, for Colab, the CU it actually used.
