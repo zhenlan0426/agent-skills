@@ -114,6 +114,8 @@ probe fails a GPU job instead of silently continuing on CPU.
   when a subsequent wait observes another state. This is an observation-based
   timer, not server queue history; the existing `--timeout` (default 45 seconds)
   still bounds each local call. No cancellation or resubmission is automatic.
+- `pull --file-pattern REGEX` downloads only matching output paths (Python regex,
+  run marker always included), for skipping checkpoints or other large files.
 - `pull` requires a new/empty local output directory, downloads all available
   output pages, and verifies the run marker and exit code. A missing marker or
   nonzero exit is not success; inspect the logs and any partial results. Inspect

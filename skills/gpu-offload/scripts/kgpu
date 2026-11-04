@@ -337,7 +337,11 @@ def pull(args):
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise ValueError('Output directory must be new or empty to avoid mixing runs.')
     target.mkdir(parents=True, exist_ok=True)
-    print(cli('kernels', 'output', job['ref'], '-p', target, timeout=args.timeout), end='')
+    command = ['kernels', 'output', job['ref'], '-p', target]
+    if args.file_pattern:
+        # The marker proves the run succeeded, so a filter never drops it.
+        command += ['--file-pattern', rf'(?:{args.file_pattern})|^kgpu-result\.json$']
+    print(cli(*command, timeout=args.timeout), end='')
     marker = target / 'kgpu-result.json'
     if not marker.is_file():
         raise ValueError('No run marker downloaded; output completeness and job success are unverified.')
@@ -366,6 +370,14 @@ def nonnegative(value):
     if number < 0:
         raise argparse.ArgumentTypeError('must be a nonnegative integer')
     return number
+
+
+def regex(value):
+    try:
+        re.compile(value)
+    except re.error as exc:
+        raise argparse.ArgumentTypeError(f'invalid regex: {exc}')
+    return value
 
 
 def main():
@@ -402,6 +414,8 @@ def main():
             p.add_argument('output')
             p.add_argument('--partial', action='store_true')
             p.add_argument('--timeout', type=positive, default=1800, help='local download timeout in seconds')
+            p.add_argument('--file-pattern', type=regex, help='download only output paths matching this Python '
+                           'regex (the run marker is always fetched); skips large files such as checkpoints')
     argv = sys.argv[1:]
     command = []
     if argv[:1] == ['prepare'] and '--' in argv:

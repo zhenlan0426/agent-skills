@@ -388,7 +388,7 @@ class HelperTests(unittest.TestCase):
 
     def test_pull_validates_run_identity_failure_and_missing_marker(self):
         job = self.prepare()
-        args = SimpleNamespace(job=str(self.job), output='', partial=False, timeout=30)
+        args = SimpleNamespace(job=str(self.job), output='', partial=False, timeout=30, file_pattern=None)
         for index, marker in enumerate([{'run_id': job['run_id'], 'exit_code': 0},
                                         {'run_id': 'wrong-run', 'exit_code': 0},
                                         {'run_id': job['run_id'], 'exit_code': 7}, None]):
@@ -405,6 +405,26 @@ class HelperTests(unittest.TestCase):
                 else:
                     with self.assertRaises(ValueError):
                         kg.pull(args)
+
+    def test_pull_filter_keeps_the_run_marker(self):
+        job = self.prepare()
+        output = self.root / 'filtered'
+        args = SimpleNamespace(job=str(self.job), output=str(output), partial=False, timeout=30,
+                               file_pattern=r'^(?!.*checkpoint\.pt$).*\.json$')
+        calls = []
+
+        def fake_cli(*a, **k):
+            calls.append(a)
+            kg.save(output / 'kgpu-result.json', {'run_id': job['run_id'], 'exit_code': 0})
+            return ''
+        with patch.dict(G, {'status': lambda *a, **k: ('complete', ''), 'cli': fake_cli}):
+            kg.pull(args)
+        pattern = calls[0][calls[0].index('--file-pattern') + 1]
+        self.assertRegex('kgpu-result.json', pattern)
+        self.assertRegex('out/run.json', pattern)
+        self.assertNotRegex('out/half/checkpoint.pt', pattern)
+        with self.assertRaises(Exception):
+            kg.regex('(')
 
 
 if __name__ == '__main__':
