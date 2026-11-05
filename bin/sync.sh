@@ -22,10 +22,11 @@ STRICT=0
 
 # Tool skill dirs as "path:comma,separated,exclusions".
 # Exclusions exist so we never shadow a skill the tool ships itself --
-# Codex ships its own skill-creator under .system/.
+# Codex ships its own skill-creator under .system/. codex-delegate is how Claude
+# drives Codex, so projecting it into Codex would invite Codex to call itself.
 TOOLS=(
   "$HOME/.claude/skills:"
-  "$HOME/.codex/skills:skill-creator"
+  "$HOME/.codex/skills:skill-creator,codex-delegate"
 )
 
 warn() { printf 'skill-sync: %s\n' "$*" >&2; }

@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# cdx: run a Codex job with full access and keep what a reviewer needs.
+#
+#   cdx run [--name N] [--model M] [--effort E] [--cd DIR] BRIEF   (BRIEF: file, or - for stdin)
+#   cdx resume JOB [--model M] [--effort E] FEEDBACK               (same Codex thread, same baseline)
+#   cdx diff JOB [git diff args]                                   (everything changed since the job began)
+#   cdx list
+#
+# JOB is a job name, a name prefix, or "last". Jobs live in ${CDX_HOME:-~/.cache/cdx}.
+#
+# Why no sandbox: Codex's bubblewrap sandbox cannot start on this host, in any
+# mode, so every sandboxed command fails. See ../SKILL.md.
+
+set -uo pipefail
+
+ROOT="${CDX_HOME:-$HOME/.cache/cdx}"
+die() { printf 'cdx: %s\n' "$*" >&2; exit 2; }
+
+resolve_job() {
+  local want="$1" hit
+  if [ "$want" = last ]; then
+    hit=$(ls -1dt "$ROOT"/*/ 2>/dev/null | head -1)
+  else
+    hit=$(ls -1dt "$ROOT/$want"*/ 2>/dev/null | head -1)
+  fi
+  [ -n "$hit" ] || die "no job matches '$want'"
+  printf '%s' "${hit%/}"
+}
+
+read_prompt() {  # source, destination
+  if [ "$1" = - ]; then cat > "$2"; else
+    [ -f "$1" ] || die "brief not found: $1"
+    cp "$1" "$2"
+  fi
+  [ -s "$2" ] || die "empty brief"
+}
+
+changed_untracked() {  # job: untracked files that appeared after the job began
+  git -C "$(cat "$1/cwd")" ls-files --others --exclude-standard | sort | comm -13 "$1/untracked.before" -
+}
+
+report() {  # job, exit code, seconds, round
+  local job="$1" rc="$2" secs="$3" round="$4" cwd
+  cwd=$(cat "$job/cwd")
+  printf 'job %s: exit %s after %ss\nlog %s\nresult %s\n' \
+    "$(basename "$job")" "$rc" "$secs" "$job/log" "$job/result-$round.md"
+  if [ -s "$job/baseline" ]; then
+    echo '--- changed since the job began'
+    git -C "$cwd" diff --stat "$(cat "$job/baseline")"
+    changed_untracked "$job" | sed 's/^/new: /'
+  fi
+  echo '--- Codex final message'
+  cat "$job/result-$round.md" 2>/dev/null || echo '(none: read the log)'
+}
+
+execute() {  # job, round, codex args...
+  local job="$1" round="$2" start rc
+  shift 2
+  start=$SECONDS
+  # The prompt arrives on stdin, which also keeps codex from waiting on an open
+  # stdin, the way a background run with a prompt argument does.
+  "$@" < "$job/prompt-$round.md" >> "$job/log" 2>&1
+  rc=$?
+  [ -s "$job/session" ] || sed -n 's/^session id: //p' "$job/log" | head -1 > "$job/session"
+  report "$job" "$rc" "$((SECONDS - start))" "$round"
+  return "$rc"
+}
+
+cmd_run() {
+  local name="" cwd="$PWD" brief="" flags=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --model) flags+=(-m "$2"); shift 2 ;;
+      --effort) flags+=(-c "model_reasoning_effort=\"$2\""); shift 2 ;;
+      --cd) cwd="$2"; shift 2 ;;
+      -) brief=-; shift ;;
+      -*) die "unknown option $1" ;;
+      *) brief="$1"; shift ;;
+    esac
+  done
+  [ -n "$brief" ] || die "no brief given"
+  cwd=$(cd "$cwd" && pwd) || die "no such directory"
+  [ -n "$name" ] || { name=$(basename "$brief"); name="${name%.*}"; [ "$name" != - ] || name=job; }
+
+  local job
+  job="$ROOT/$name-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$job" || die "cannot create $job"
+  printf '%s\n' "$cwd" > "$job/cwd"
+  read_prompt "$brief" "$job/prompt-1.md"
+
+  if git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
+    # A snapshot of tracked edits, so a dirty tree does not count as Codex's work.
+    { git -C "$cwd" stash create | grep . || git -C "$cwd" rev-parse HEAD; } > "$job/baseline" 2>/dev/null
+    git -C "$cwd" ls-files --others --exclude-standard | sort > "$job/untracked.before"
+  else
+    : > "$job/baseline"
+    flags+=(--skip-git-repo-check)
+  fi
+
+  execute "$job" 1 codex exec -s danger-full-access -C "$cwd" -o "$job/result-1.md" "${flags[@]}" -
+}
+
+cmd_resume() {
+  [ $# -ge 2 ] || die "usage: cdx resume JOB [--model M] [--effort E] FEEDBACK"
+  local job feedback="" flags=()
+  job=$(resolve_job "$1"); shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --model) flags+=(-m "$2"); shift 2 ;;
+      --effort) flags+=(-c "model_reasoning_effort=\"$2\""); shift 2 ;;
+      -) feedback=-; shift ;;
+      -*) die "unknown option $1" ;;
+      *) feedback="$1"; shift ;;
+    esac
+  done
+  [ -n "$feedback" ] || die "no feedback given"
+  [ -s "$job/session" ] || die "job has no Codex session id: see $job/log"
+
+  local round
+  round=$(( $(ls "$job"/prompt-*.md | wc -l) + 1 ))
+  read_prompt "$feedback" "$job/prompt-$round.md"
+  cd "$(cat "$job/cwd")" || die "job directory is gone"
+  # resume has no -s flag; without this override it falls back to config.toml's sandbox.
+  execute "$job" "$round" codex exec resume -c 'sandbox_mode="danger-full-access"' \
+    -o "$job/result-$round.md" "${flags[@]}" "$(cat "$job/session")" -
+}
+
+cmd_diff() {
+  [ $# -ge 1 ] || die "usage: cdx diff JOB [git diff args]"
+  local job cwd
+  job=$(resolve_job "$1"); shift
+  [ -s "$job/baseline" ] || die "job did not run in a git repo"
+  cwd=$(cat "$job/cwd")
+  git -C "$cwd" --no-pager diff "$(cat "$job/baseline")" "$@"
+  changed_untracked "$job" | sed 's/^/new file (not in the diff above): /'
+}
+
+cmd_list() {
+  ls -1t "$ROOT" 2>/dev/null | head -20
+}
+
+sub="${1:-}"
+[ $# -gt 0 ] && shift
+case "$sub" in
+  run) cmd_run "$@" ;;
+  resume) cmd_resume "$@" ;;
+  diff) cmd_diff "$@" ;;
+  list) cmd_list ;;
+  *) sed -n 2,9p "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
