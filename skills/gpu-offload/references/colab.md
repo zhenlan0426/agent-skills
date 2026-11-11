@@ -45,6 +45,9 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
   plus one ~7-minute A100 cost 4.87 CU, which matches ~15 minutes billed for
   each. Don't allocate VMs just to test availability, and reuse one session
   instead of repeatedly running `up`/`down`.
+- The balance is per account. A before/after difference includes every other
+  session live in that window, so note how many `cgpu ls` listed when you
+  report CU used.
 - `cgpu up` refuses a session name that is already live: the raw CLI would
   allocate a second VM under it and orphan the first, still billed. To replace
   a session, `cgpu down` it first.
@@ -97,7 +100,12 @@ cgpu down job1                                 # always, once results are safe (
   safe. An interrupted `start` is settled the same way by the next one.
 - **Data:** local files go through `push`, which chunks uploads (about 7MB/s
   when tested; a few GB is fine, much more is slow). A part that stalls for 3
-  minutes is retried; one 40MB part once hung for 25 minutes with no error. For Kaggle and Hugging
+  minutes is retried; one 40MB part once hung for 25 minutes with no error. A
+  single file of 40MB or less needs its remote directory to exist already
+  (`cgpu sh job1 -- mkdir -p DIR` while the kernel is idle); larger files and
+  directories create it. To run one exact commit rather than the working tree,
+  push a `git bundle` and `git clone` it on the VM (directory pushes drop
+  `.git` and include uncommitted edits). For Kaggle and Hugging
   Face data, download on the VM: `cgpu secrets` installs
   `~/.kaggle/kaggle.json` and the HF token there, then use the `kaggle` CLI or
   `huggingface_hub` inside the job.
@@ -116,6 +124,10 @@ cgpu down job1                                 # always, once results are safe (
     beside the destination and renames, so an interrupted pull keeps the last
     good copy. Have the job likewise write each checkpoint under a temporary
     name and rename it into place, so a pull never catches half a file.
+    Better, have it then write a small JSON sidecar holding the step and the
+    checkpoint's SHA-256. The poller pulls the sidecar first, pulls the
+    checkpoint only when the step advanced, and replaces its local copy only
+    when the hash matches, so a raced or corrupt pull keeps the last good one.
   Decide which of these to use with the user before starting a multi-hour job.
 ## Getting large results off the VM
 
@@ -147,6 +159,47 @@ file (full table: cLLM `runs/g4-scale/transfer-test.md`):
 - The image tested (September 2026) had Python 3.13 and torch 2.11+cu128.
   Images change: `cgpu setup` prints the current fingerprint, and
   [environments.md](environments.md) covers installing without replacing it.
+
+## Scripting an unattended run
+
+For a multi-hour or repeated job, write one local driver that owns the whole
+session instead of issuing the commands turn by turn. cLLM's
+`scripts/colab_run.py` (driver) and `scripts/colab_job.py` (the job it starts)
+are a worked example with offline tests against a fake `cgpu`. What they
+learned:
+
+- **Do nothing on the billed VM that can be done at home.** Run tests and a
+  small smoke fit locally, and check that every input file exists before
+  `up`. Instead of a memory probe, have the job retry a stage at half the
+  micro-batch when its output contains `CUDA out of memory`, resuming from the
+  stage's checkpoint.
+- **Rehearse the plumbing on a CPU VM** (`cgpu up NAME cpu`, 0.08 CU/hr) with
+  a flag that makes the job stop before training. That exercises allocation,
+  pushes, secrets, `setup`, data download, retrieval and shutdown. Measured
+  2026-11-11: 45 s from allocation to job start, 11 s to download and hash 52
+  files from a private Kaggle dataset, 4 s for retrieval and shutdown.
+- **`up` can fail after it has allocated** (its GPU check is a separate exec).
+  Treat the VM as allocated from the moment `up` is called and run `down` on
+  that path, except when `up` refused because the name already exists.
+- **After `start` is called, assume a job may be running** even if `start`
+  returned an error, and leave the VM up rather than shutting it down.
+- **`cgpu wait`'s exit code alone doesn't prove the job ended.** It returns
+  the job's own code, 124 on `--timeout`, and 1 or 3 for transport errors or
+  a lost job, which a job can also return. Loop on `wait --timeout SECS`:
+  treat 124 as still running (pull the checkpoint, print the last log line),
+  end only when the output contains `FINISHED exit=`, treat "session '…' is
+  gone" as a lost VM, and retry anything else a few times. A driver that took
+  a transport error for the job's exit would retrieve and shut down under a
+  live training run.
+- **One results file, verified before `down`.** The job writes a single
+  uncompressed tar of the small results plus a sidecar with its size and
+  SHA-256, rebuilt after every stage and on failure, each written under a
+  temporary name and renamed. The driver pulls both, checks them, unpacks into
+  a scratch directory, and only then copies into place and runs `down`.
+- **Every exit path ends in `down` or a last printed line saying the VM is
+  still billing and why** (failed retrieval, a kept VM, an uncertain start).
+- Record the balance before `up` and after `down`, with the session count
+  (the balance is per account).
 
 ## Behavior the helper works around (verified on colab-cli 0.7.4)
 

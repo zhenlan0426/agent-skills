@@ -125,4 +125,8 @@ offline wheels for Kaggle.
   ([references/colab.md](references/colab.md#getting-large-results-off-the-vm)).
 - Don't resubmit unchanged after a failure you haven't diagnosed. On Colab,
   every re-allocation costs compute units again.
-- Report where the job ran and, for Colab, the CU it actually used.
+- Report where the job ran and, for Colab, the CU it actually used (the
+  balance is per account, so say if other sessions were live).
+- For a multi-hour or repeated Colab job, script the whole session in one
+  local driver and rehearse it on a CPU VM first
+  ([references/colab.md](references/colab.md#scripting-an-unattended-run)).
