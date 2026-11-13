@@ -14,6 +14,9 @@
 set -uo pipefail
 
 ROOT="${CDX_HOME:-$HOME/.cache/cdx}"
+# Defaults for every run and resume; --model/--effort override them.
+DEFAULT_MODEL=gpt-6.1-sol
+DEFAULT_EFFORT=medium
 die() { printf 'cdx: %s\n' "$*" >&2; exit 2; }
 
 resolve_job() {
@@ -67,18 +70,19 @@ execute() {  # job, round, codex args...
 }
 
 cmd_run() {
-  local name="" cwd="$PWD" brief="" flags=()
+  local name="" cwd="$PWD" brief="" flags=() model=$DEFAULT_MODEL effort=$DEFAULT_EFFORT
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
-      --model) flags+=(-m "$2"); shift 2 ;;
-      --effort) flags+=(-c "model_reasoning_effort=\"$2\""); shift 2 ;;
+      --model) model="$2"; shift 2 ;;
+      --effort) effort="$2"; shift 2 ;;
       --cd) cwd="$2"; shift 2 ;;
       -) brief=-; shift ;;
       -*) die "unknown option $1" ;;
       *) brief="$1"; shift ;;
     esac
   done
+  flags+=(-m "$model" -c "model_reasoning_effort=\"$effort\"")
   [ -n "$brief" ] || die "no brief given"
   cwd=$(cd "$cwd" && pwd) || die "no such directory"
   [ -n "$name" ] || { name=$(basename "$brief"); name="${name%.*}"; [ "$name" != - ] || name=job; }
@@ -103,17 +107,18 @@ cmd_run() {
 
 cmd_resume() {
   [ $# -ge 2 ] || die "usage: cdx resume JOB [--model M] [--effort E] FEEDBACK"
-  local job feedback="" flags=()
+  local job feedback="" flags=() model=$DEFAULT_MODEL effort=$DEFAULT_EFFORT
   job=$(resolve_job "$1"); shift
   while [ $# -gt 0 ]; do
     case "$1" in
-      --model) flags+=(-m "$2"); shift 2 ;;
-      --effort) flags+=(-c "model_reasoning_effort=\"$2\""); shift 2 ;;
+      --model) model="$2"; shift 2 ;;
+      --effort) effort="$2"; shift 2 ;;
       -) feedback=-; shift ;;
       -*) die "unknown option $1" ;;
       *) feedback="$1"; shift ;;
     esac
   done
+  flags+=(-m "$model" -c "model_reasoning_effort=\"$effort\"")
   [ -n "$feedback" ] || die "no feedback given"
   [ -s "$job/session" ] || die "job has no Codex session id: see $job/log"
 

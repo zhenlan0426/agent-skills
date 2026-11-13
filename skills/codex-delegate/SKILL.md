@@ -51,8 +51,9 @@ exits, so do not poll. Keep working on anything independent.
 ~/.claude/skills/codex-delegate/scripts/cdx run --name attn-pool "$SCRATCHPAD/attn-pool.md"
 ```
 
-Model and effort come from `~/.codex/config.toml`. Pass `--model` and `--effort`
-only when the user names them: "6.1 sol high" is `--model gpt-6.1-sol --effort high`.
+`cdx` defaults to `gpt-6.1-sol` at `medium` effort, on both `run` and `resume`,
+whatever `~/.codex/config.toml` says. Pass `--model` and `--effort` only when the
+user names them: "6.1 terra high" is `--model gpt-6.1-terra --effort high`.
 
 Two jobs at once must not share a working tree. Give each its own `git worktree`
 and pass `--cd`.
