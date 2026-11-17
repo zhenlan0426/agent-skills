@@ -15,7 +15,7 @@ set -uo pipefail
 
 ROOT="${CDX_HOME:-$HOME/.cache/cdx}"
 # Defaults for every run and resume; --model/--effort override them.
-DEFAULT_MODEL=gpt-6.1-sol
+DEFAULT_MODEL=gpt-6.2-sol
 DEFAULT_EFFORT=medium
 die() { printf 'cdx: %s\n' "$*" >&2; exit 2; }
 

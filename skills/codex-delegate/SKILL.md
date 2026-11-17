@@ -51,7 +51,7 @@ exits, so do not poll. Keep working on anything independent.
 ~/.claude/skills/codex-delegate/scripts/cdx run --name attn-pool "$SCRATCHPAD/attn-pool.md"
 ```
 
-`cdx` defaults to `gpt-6.1-sol` at `medium` effort, on both `run` and `resume`,
+`cdx` defaults to `gpt-6.2-sol` at `medium` effort, on both `run` and `resume`,
 whatever `~/.codex/config.toml` says. Pass `--model` and `--effort` only when the
 user names them: "6.1 terra high" is `--model gpt-6.1-terra --effort high`.
 
