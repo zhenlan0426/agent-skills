@@ -102,7 +102,10 @@ cgpu down job1                                 # always, once results are safe (
   when tested; a few GB is fine, much more is slow). A part that stalls for 3
   minutes is retried; one 40MB part once hung for 25 minutes with no error. A
   single file of 40MB or less needs its remote directory to exist already
-  (`cgpu sh job1 -- mkdir -p DIR` while the kernel is idle); larger files and
+  (`cgpu sh job1 -- mkdir -p DIR` while the kernel is idle) and a full
+  destination file path: `push job1 f.txt /content/in/` (directory
+  destination) fails with HTTP 500, `push job1 f.txt /content/in/f.txt`
+  works (2026-11-21); larger files and
   directories create it. To run one exact commit rather than the working tree,
   push a `git bundle` and `git clone` it on the VM (directory pushes drop
   `.git` and include uncommitted edits). For Kaggle and Hugging
@@ -228,6 +231,16 @@ learned:
   large `pull` runs. Retry it. Then check that the command took effect: a `git
   commit` sent through `sh` once failed silently, and the next step refused on a
   dirty tree.
+- **`sh` can hang forever after "Connection was lost", with the VM billing.**
+  On 2026-11-21 a `cgpu sh` (a `git clone`, first exec on a fresh G4) printed
+  the error and then sat for over 30 minutes without exiting, despite its
+  internal exec timeout; the command never ran on the VM. About 4.6 CU were
+  wasted, partly because setup was chained in one blocking Bash call (sh &&
+  secrets && setup) with a 30-minute tool timeout, so nothing surfaced. Wrap
+  every pre-job `sh` and `push` in a local `timeout` (`timeout 300 cgpu sh ...`;
+  longer only for `setup`), run each step as its own call, and on a timeout
+  kill the local client, probe with a short `sh` (`ls`), and retry: the probe
+  and retry worked at once.
 
 - `cgpu logs` shows the job's own output. The attached client's output is in
   `~/.cache/cgpu/<session>-<job>.client.log`.
