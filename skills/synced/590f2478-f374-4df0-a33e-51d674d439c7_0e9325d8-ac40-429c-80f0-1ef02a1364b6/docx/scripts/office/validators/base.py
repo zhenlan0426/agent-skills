@@ -86,6 +86,11 @@ class BaseSchemaValidator:
 
     MAIN_CONTENT_FOLDERS = {"word", "ppt", "xl"}
 
+    XML_SPACE_ELEMENTS = {
+        "http://schemas.openxmlformats.org/wordprocessingml/2006/main": ("t", "delText", "instrText", "delInstrText"),
+        "http://schemas.openxmlformats.org/officeDocument/2006/math": ("t",),
+    }
+
     OOXML_NAMESPACES = {
         "http://schemas.openxmlformats.org/officeDocument/2006/math",
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
@@ -135,8 +140,7 @@ class BaseSchemaValidator:
                 pending = []  
 
                 for elem in dom.getElementsByTagName("*"):
-                    local_name = elem.tagName.rsplit(":", 1)[-1]
-                    if local_name in ("t", "delText", "instrText", "delInstrText"):
+                    if elem.localName in self.XML_SPACE_ELEMENTS.get(elem.namespaceURI, ()):
                         text = "".join(
                             child.data
                             for child in elem.childNodes
