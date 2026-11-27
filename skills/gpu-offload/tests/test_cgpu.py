@@ -204,6 +204,29 @@ class CgpuTest(unittest.TestCase):
         self.cgpu("down", "s")
         self.cgpu("up", "s", "T4")
 
+    def test_up_retries_capacity_refusals_then_allocates(self):
+        r = self.cgpu("up", "s", "G4", "--retry-for", "5s", "--retry-every", "0.2s",
+                      env={"FAKE_COLAB_NO_CAPACITY": "2"})
+        self.assertEqual(r.stdout.count("has no capacity"), 2)
+        allocs = (self.fake / "allocations.log").read_text().splitlines()
+        self.assertEqual(len(allocs), 1)
+        self.assertTrue(all(c[c.index("--gpu") + 1] == "G4"
+                            for c in self.calls() if c[0] == "new"))
+
+    def test_up_gives_up_on_capacity_with_tempfail(self):
+        r = self.cgpu("up", "s", "G4", "--retry-for", "0.5s", "--retry-every", "0.2s",
+                      ok=False, env={"FAKE_COLAB_NO_CAPACITY": "99"})
+        self.assertEqual(r.returncode, 75)
+        attempts = [c[0] for c in self.calls()].count("new")
+        self.assertGreater(attempts, 1)
+        self.assertIn(f"no G4 capacity after {attempts} attempt(s)", r.stderr)
+        self.assertFalse((self.fake / "allocations.log").exists())
+
+    def test_up_without_retry_fails_once(self):
+        r = self.cgpu("up", "s", "G4", ok=False, env={"FAKE_COLAB_NO_CAPACITY": "1"})
+        self.assertEqual(r.returncode, 75)
+        self.assertEqual([c[0] for c in self.calls()].count("new"), 1)
+
     # -------------------------------------------------------------- pull
 
     def pull_setup(self):

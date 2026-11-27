@@ -24,6 +24,16 @@ ROOT = Path(os.environ["FAKE_COLAB"])
 MAP = ROOT / "sessions.json"  # local name -> VM id, as colab-cli keeps it
 
 
+def refuse_capacity():
+    """Refuse the first $FAKE_COLAB_NO_CAPACITY `new` calls with 0.7.4's 503 error."""
+    left = ROOT / "no-capacity-left"
+    if not left.exists():
+        left.write_text(os.environ.get("FAKE_COLAB_NO_CAPACITY", "0"))
+    n = int(left.read_text())
+    left.write_text(str(max(n - 1, 0)))
+    return n > 0
+
+
 def names():
     return json.loads(MAP.read_text()) if MAP.exists() else {}
 
@@ -74,6 +84,11 @@ def main():
     s = opt(rest, "-s")
     if cmd == "version":
         print("Version: 0.7.4")
+    elif cmd == "new" and refuse_capacity():
+        print(f"[colab] Creating session '{s}'...")
+        print("ColabRequestError: Failed to issue request POST https://colab.research.google.com"
+              "/tun/m/assign?variant=GPU&accelerator=G4: Service Unavailable", file=sys.stderr)
+        sys.exit(1)
     elif cmd == "new":
         vm = uuid.uuid4().hex[:8]
         for top in ("content", "tmp", "root"):

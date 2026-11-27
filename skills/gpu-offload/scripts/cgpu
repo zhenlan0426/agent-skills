@@ -15,7 +15,9 @@ Commands after `--` are an argv, run without a shell. For pipes, globs or `&&`,
 say so explicitly: `-- bash -c 'pip list | grep torch'`.
 
 Usage:
-  cgpu up SESSION GPU [--high-mem]        GPU: T4 L4 G4 A100 H100 cpu
+  cgpu up SESSION GPU [--high-mem] [--retry-for 3h] [--retry-every 10m]
+                                          GPU: T4 L4 G4 A100 H100 cpu; --retry-for keeps
+                                          retrying "no capacity" refusals (never another GPU)
   cgpu push SESSION LOCAL [REMOTE]        file or dir (dirs are tarred); default /content/<basename>
   cgpu secrets SESSION [kaggle] [hf]      copy ~/.kaggle/kaggle.json / HF token onto the VM
   cgpu setup SESSION [-- ARGS]            fingerprint the VM, then `envsetup install ARGS`
@@ -73,6 +75,24 @@ BEAT_STALE = 180
 START_WAIT = int(os.environ.get("CGPU_START_WAIT", 180))
 TERM_GRACE = float(os.environ.get("CGPU_TERM_GRACE", 5))
 KILL_WAIT = float(os.environ.get("CGPU_KILL_WAIT", 5))
+
+
+# colab-cli 0.7.4's `new` error when the requested GPU pool is full (HTTP 503 on
+# /tun/m/assign); seen repeatedly for G4 in Nov 2026. A refusal allocates and bills nothing.
+NO_CAPACITY = "Service Unavailable"
+EX_TEMPFAIL = 75  # `up` exit code when the GPU stayed out of capacity
+
+
+def duration(text):
+    """Seconds from '600', '90s', '10m' or '3h'."""
+    scale = {"s": 1, "m": 60, "h": 3600}.get(text[-1:].lower())
+    try:
+        value = float(text[:-1] if scale else text) * (scale or 1)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"bad duration '{text}'; use e.g. 600, 10m or 3h")
+    if value < 0:
+        raise argparse.ArgumentTypeError("duration must not be negative")
+    return value
 
 
 def die(msg, code=1):
@@ -325,10 +345,27 @@ def cmd_up(a):
     if any(line.startswith(f"[{a.session}] ") for line in listing.splitlines()):
         die(f"session '{a.session}' already exists. Use it as is, pick another "
             f"name, or replace it deliberately: `cgpu down {a.session}` first")
-    r = colab(*args, capture=True, check=False)
+    deadline = time.monotonic() + a.retry_for
+    attempt = 1
+    while True:
+        r = colab(*args, capture=True, check=False)
+        refused = r.returncode != 0 and NO_CAPACITY in r.stdout + r.stderr
+        if refused and time.monotonic() + a.retry_every <= deadline:
+            # Only the capacity refusal is retried; any other error (auth, plan,
+            # too many assignments) fails at once. The GPU type never changes.
+            print(f"[cgpu] {time.strftime('%H:%M:%S')} {gpu} has no capacity (attempt "
+                  f"{attempt}); retrying in {a.retry_every:.0f}s")
+            time.sleep(a.retry_every)
+            attempt += 1
+            continue
+        break
     print(r.stdout, end="")
     if r.returncode != 0:
         sys.stderr.write(r.stderr)
+        if refused:
+            die(f"no {gpu} capacity after {attempt} attempt(s); nothing was allocated. "
+                "Retry later (--retry-for) or ask the user before trying a different GPU.",
+                EX_TEMPFAIL)
         die(f"could not allocate {gpu}; it may be unavailable right now or not "
             "in this plan. Ask the user before trying a different GPU.", r.returncode)
     job_file(a.session).unlink(missing_ok=True)  # a fresh VM has no jobs
@@ -780,7 +817,12 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="c", required=True)
     s = sub.add_parser("up"); s.add_argument("session"); s.add_argument("gpu")
-    s.add_argument("--high-mem", action="store_true"); s.set_defaults(f=cmd_up)
+    s.add_argument("--high-mem", action="store_true")
+    s.add_argument("--retry-for", type=duration, default=0,
+                   help="keep retrying no-capacity refusals for this long (e.g. 3h)")
+    s.add_argument("--retry-every", type=duration, default=600,
+                   help="pause between capacity retries (default 10m)")
+    s.set_defaults(f=cmd_up)
     s = sub.add_parser("push"); s.add_argument("session"); s.add_argument("local")
     s.add_argument("remote", nargs="?"); s.set_defaults(f=cmd_push)
     s = sub.add_parser("secrets"); s.add_argument("session")
