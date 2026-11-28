@@ -30,6 +30,8 @@ Usage:
   cgpu pull SESSION REMOTE LOCAL          file: to LOCAL, or into it if LOCAL is a dir
                                           or ends in /; dir: its contents into LOCAL
   cgpu sh SESSION -- CMD                  run a short command (kernel must be idle)
+  cgpu claim SESSION TOKEN                claim an idle session for a driver
+  cgpu release SESSION TOKEN              release that driver's claim after its job ends
   cgpu down SESSION                       stop the VM and print the compute-unit balance
   cgpu ls                                 sessions + compute-unit usage
 
@@ -38,9 +40,12 @@ Env: CGPU_AUTH (default oauth2) is passed as `colab --auth=...`;
      the kernel's queue.
 """
 import argparse
+from contextlib import redirect_stdout
 import fcntl
+import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -58,6 +63,7 @@ AUTH = os.environ.get("CGPU_AUTH", "oauth2")
 GPUS = {"T4", "L4", "G4", "A100", "H100"}
 STATE_DIR = Path.home() / ".cache" / "cgpu"
 REMOTE_ROOT = "/content/.cgpu"
+OWNER_FILE = "/content/.cgpu-session-owner"
 ENVSETUP = Path(__file__).resolve().parent / "envsetup"
 PUSH_EXCLUDED = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.pytest_cache',
                  '.mypy_cache', '.ipynb_checkpoints', '.kaggle', '.ssh', '.aws', '.cache',
@@ -228,7 +234,7 @@ def session_lock(session):
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        die(f"another `cgpu up/start/push/down` on '{session}' is in progress")
+        die(f"another `cgpu up/start/push/down/claim/release` on '{session}' is in progress")
     return lock
 
 
@@ -297,6 +303,62 @@ def require_idle(session, what):
         die(f"{what} needs an idle kernel, but job {job['id']} is {kind} on "
             f"'{session}'. Wait for it (`cgpu wait {session}`), use a second "
             "session, or pull single files, which work mid-job")
+
+
+def ownership_probe(session, timeout):
+    """Read the VM monotonic clock only after an idle kernel executes our probe.
+
+    A timed-out probe may still run later, but it cannot change the VM. A later
+    claim/release cell uses the returned clock value as its deadline, so it too
+    cannot change ownership if it was queued behind another job for too long.
+    """
+    job = load_job(session)
+    if job is not None:
+        kind, _ = job_state(session, job)
+        if kind in ("running", "queued"):
+            die(f"cannot establish ownership: job {job['id']} is {kind} on '{session}'")
+        if kind == "lost" and not job.get("killed"):
+            die("cannot establish ownership: " + lost_msg(session, job))
+    marker = f"__CGPU_IDLE_{uuid.uuid4().hex}__="
+    output = io.StringIO()
+    with redirect_stdout(output):
+        rc = exec_py(session, f"import time\nprint({marker!r} + repr(time.monotonic()))",
+                     timeout=str(timeout), check=False)
+    match = re.search(re.escape(marker) + r"([0-9]+(?:\.[0-9]+)?)", output.getvalue())
+    if rc or not match:
+        print(output.getvalue(), end="")
+        die(f"cannot establish ownership of '{session}': kernel is busy or the idle probe failed (exit {rc})")
+    return float(match[1])
+
+
+def ownership_action(a, *, release=False):
+    if not re.fullmatch(r"[a-f0-9]{32}", a.token):
+        die("ownership token must be 32 lowercase hexadecimal characters")
+    if a.timeout <= 0:
+        die("ownership timeout must be positive")
+    lock = session_lock(a.session)  # noqa: F841 (also serialize against local up/start/push/down)
+    deadline = ownership_probe(a.session, a.timeout) + a.timeout
+    if release:
+        action = (f"    try:\n        with open({OWNER_FILE!r}) as f:\n            owner = f.read().strip()\n"
+                  "    except FileNotFoundError:\n        owner = None\n"
+                  f"    if owner != {a.token!r}:\n"
+                  "        print('ownership release refused: token does not match')\n        _cgpu_rc = 1\n"
+                  f"    else:\n        os.unlink({OWNER_FILE!r})\n        print('ownership released')\n")
+    else:
+        action = ("    try:\n"
+                  f"        fd = os.open({OWNER_FILE!r}, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n"
+                  "    except FileExistsError:\n"
+                  "        print('ownership refused: session is already claimed by another driver')\n        _cgpu_rc = 1\n"
+                  f"    else:\n        with os.fdopen(fd, 'w') as f:\n            f.write({a.token!r} + '\\n')\n"
+                  "        print('ownership established')\n")
+    code = ("import os, time\n"
+            f"if time.monotonic() > {deadline!r}:\n"
+            "    print('ownership attempt expired while the kernel was busy')\n    _cgpu_rc = 1\n"
+            "else:\n" + action)
+    rc = exec_py(a.session, code, timeout=str(a.timeout), check=False)
+    if rc:
+        die(f"could not {'release' if release else 'establish'} ownership of '{a.session}' (exit {rc}); "
+            "leave the session running and inspect it", 1)
 
 
 def excluded_push_path(rel):
@@ -385,16 +447,32 @@ def cmd_up(a):
     job_file(a.session).unlink(missing_ok=True)  # a fresh VM has no jobs
     # The VM is allocated (and billed) now; a dropped connection here is retried
     # rather than failing `up` and throwing away capacity that took hours to get.
+    if gpu == "CPU":
+        fingerprint = "print('CPU allocation (no GPU requested)')"
+    else:
+        fingerprint = ("import subprocess\n"
+                       "try:\n"
+                       "    query = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', "
+                       "'--format=csv,noheader'], capture_output=True, text=True)\n"
+                       "except OSError as e:\n"
+                       "    print(f'GPU fingerprint failed: cannot run nvidia-smi: {e}')\n    _cgpu_rc = 1\n"
+                       "else:\n"
+                       "    if query.returncode:\n"
+                       "        print(f'GPU fingerprint failed: nvidia-smi exited {query.returncode}: '"
+                       "              f'{query.stderr.strip()}')\n        _cgpu_rc = 1\n"
+                       "        if query.stdout.strip():\n"
+                       "            print(f'nvidia-smi stdout: {query.stdout.strip()}')\n"
+                       "    elif not query.stdout.strip():\n"
+                       "        print(f'GPU fingerprint failed: nvidia-smi returned empty output: '"
+                       "              f'{query.stderr.strip()}')\n        _cgpu_rc = 1\n"
+                       "    else:\n        print(query.stdout.strip())\n")
     for attempt in range(1, 4):
-        rc = exec_py(a.session, "import shutil, subprocess\nprint(shutil.which('nvidia-smi') and "
-                     "subprocess.run(['nvidia-smi','--query-gpu=name,memory.total',"
-                     "'--format=csv,noheader'],capture_output=True,text=True).stdout or 'no GPU')",
-                     timeout="120", check=False)
+        rc = exec_py(a.session, fingerprint, timeout="120", check=False)
         if rc == 0:
             break
         print(f"[cgpu] fingerprint check failed (exit {rc}, attempt {attempt}/3)", flush=True)
     else:
-        die(f"{a.session} was allocated but never answered the fingerprint check; "
+        die(f"{a.session} was allocated but did not pass the fingerprint check after 3 attempts; "
             f"`cgpu down {a.session}` unless you want to inspect it", rc)
     colab("usage")
 
@@ -868,6 +946,10 @@ def main():
     s.add_argument("local"); s.set_defaults(f=cmd_pull)
     s = sub.add_parser("sh"); s.add_argument("session")
     s.add_argument("--timeout", type=int, default=600); s.set_defaults(f=cmd_sh)
+    for name in ("claim", "release"):
+        s = sub.add_parser(name); s.add_argument("session"); s.add_argument("token")
+        s.add_argument("--timeout", type=int, default=15)
+        s.set_defaults(f=partial(ownership_action, release=name == "release"))
     s = sub.add_parser("down"); s.add_argument("session"); s.set_defaults(f=cmd_down)
     s = sub.add_parser("ls"); s.set_defaults(f=cmd_ls)
     argv = sys.argv[1:]

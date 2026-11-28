@@ -6,6 +6,7 @@ These cover failure paths a real VM rarely shows on demand. The happy path is
 still worth checking on a real T4 after changing cgpu.
 """
 import json
+from concurrent.futures import ThreadPoolExecutor
 import os
 import runpy
 import signal
@@ -15,6 +16,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
@@ -229,7 +231,129 @@ class CgpuTest(unittest.TestCase):
 
     def test_up_fails_after_three_lost_fingerprints(self):
         r = self.cgpu("up", "s", "G4", ok=False, env={"FAKE_COLAB_EXEC_LOST": "9"})
-        self.assertIn("never answered the fingerprint check", r.stderr)
+        self.assertIn("did not pass the fingerprint check after 3 attempts", r.stderr)
+
+    def test_up_retries_failed_nvidia_query_without_reallocating(self):
+        nvidia = self.tmp / "bin/nvidia-smi"
+        nvidia.write_text("#!/bin/sh\necho device-details\necho driver-error >&2\nexit 9\n")
+        r = self.cgpu("up", "s", "G4", ok=False)
+        self.assertIn("nvidia-smi exited 9: driver-error", r.stdout)
+        self.assertIn("nvidia-smi stdout: device-details", r.stdout)
+        self.assertEqual(r.stdout.count("fingerprint check failed"), 3)
+        self.assertEqual([c[0] for c in self.calls()].count("exec"), 3)
+        self.assertEqual([c[0] for c in self.calls()].count("new"), 1)
+        self.assertEqual(len((self.fake / "allocations.log").read_text().splitlines()), 1)
+
+    def test_up_retries_empty_fingerprint(self):
+        (self.tmp / "bin/nvidia-smi").write_text("#!/bin/sh\nprintf '  \\n'\n")
+        r = self.cgpu("up", "s", "G4", ok=False)
+        self.assertIn("nvidia-smi returned empty output", r.stdout)
+        self.assertEqual(r.stdout.count("fingerprint check failed"), 3)
+        self.assertEqual([c[0] for c in self.calls()].count("new"), 1)
+
+    def test_up_retries_missing_nvidia_binary(self):
+        bin_ = self.tmp / "bin"
+        (bin_ / "nvidia-smi").unlink()
+        (bin_ / "python3").symlink_to(sys.executable)
+        r = self.cgpu("up", "s", "G4", ok=False, env={"PATH": str(bin_)})
+        self.assertIn("cannot run nvidia-smi", r.stdout)
+        self.assertEqual(r.stdout.count("fingerprint check failed"), 3)
+        self.assertEqual([c[0] for c in self.calls()].count("new"), 1)
+
+    def test_up_recovers_fingerprint_on_same_vm(self):
+        (self.tmp / "bin/nvidia-smi").write_text(
+            "#!/bin/sh\n"
+            "counter=\"$FAKE_COLAB/nvidia-attempts\"\n"
+            "n=0; [ ! -f \"$counter\" ] || n=$(cat \"$counter\")\n"
+            "n=$((n + 1)); echo \"$n\" > \"$counter\"\n"
+            "if [ \"$n\" -lt 3 ]; then echo 'driver starting' >&2; exit 9; fi\n"
+            "echo 'RTX PRO 6000, 98304'\n")
+        r = self.cgpu("up", "s", "G4")
+        self.assertEqual(r.stdout.count("fingerprint check failed"), 2)
+        self.assertIn("RTX PRO 6000, 98304", r.stdout)
+        self.assertEqual((self.fake / "nvidia-attempts").read_text().strip(), "3")
+        self.assertEqual([c[0] for c in self.calls()].count("new"), 1)
+        self.assertEqual([c[0] for c in self.calls()].count("exec"), 3)
+
+    def test_cpu_allocation_does_not_require_nvidia_smi(self):
+        bin_ = self.tmp / "bin"
+        (bin_ / "nvidia-smi").unlink()
+        (bin_ / "python3").symlink_to(sys.executable)
+        r = self.cgpu("up", "s", "cpu", env={"PATH": str(bin_)})
+        self.assertIn("CPU allocation (no GPU requested)", r.stdout)
+        self.assertEqual([c[0] for c in self.calls()].count("exec"), 1)
+
+    # ---------------------------------------------------------- ownership
+
+    def test_claim_refuses_running_job_without_changing_files(self):
+        self.cgpu("up", "s", "cpu")
+        self.cgpu("start", "s", "--", "sleep", "30")
+        target = self.vm() / "content/job.json"
+        target.write_text("original job")
+        before = len(self.calls())
+        r = self.cgpu("claim", "s", "a" * 32, ok=False)
+        self.assertIn("cannot establish ownership", r.stderr)
+        self.assertIn("is running", r.stderr)
+        self.assertEqual(target.read_text(), "original job")
+        self.assertFalse((self.vm() / "content/.cgpu-session-owner").exists())
+        self.assertNotIn("upload", [c[0] for c in self.calls()[before:]])
+        self.assertNotIn("stop", [c[0] for c in self.calls()[before:]])
+
+    def test_two_callers_cannot_claim_same_idle_vm(self):
+        self.cgpu("up", "s", "cpu")
+        tokens = ["a" * 32, "b" * 32]
+        # Separate homes bypass local flock; the VM-side claim must still arbitrate.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda item: self.cgpu("claim", "s", item[1], ok=None,
+                                                          env={"HOME": str(self.tmp / f"home{item[0]}")}),
+                                    enumerate(tokens)))
+        self.assertEqual(sorted(r.returncode == 0 for r in results), [False, True])
+        winner = tokens[next(i for i, r in enumerate(results) if r.returncode == 0)]
+        loser = tokens[1 - tokens.index(winner)]
+        owner = self.vm() / "content/.cgpu-session-owner"
+        self.assertEqual(owner.read_text().strip(), winner)
+        bad = self.cgpu("release", "s", loser, ok=False)
+        self.assertIn("token does not match", bad.stdout)
+        self.assertEqual(owner.read_text().strip(), winner)
+        self.cgpu("release", "s", winner)
+        self.assertFalse(owner.exists())
+        self.cgpu("claim", "s", loser)
+        self.assertEqual(owner.read_text().strip(), loser)
+
+    def test_busy_unknown_kernel_cannot_claim_later(self):
+        self.cgpu("up", "s", "cpu")
+        self.occupy_kernel(4)  # No local cgpu job record.
+        r = self.cgpu("claim", "s", "a" * 32, "--timeout", "1", ok=False)
+        self.assertIn("kernel is busy or the idle probe failed", r.stderr)
+        time.sleep(4)  # The queued, read-only probe runs after the client gives up.
+        self.assertFalse((self.vm() / "content/.cgpu-session-owner").exists())
+
+    def test_claim_queued_after_probe_expires_without_changing_vm(self):
+        self.cgpu("up", "s", "cpu")
+        with patch.dict(os.environ, self.env, clear=True):
+            action = runpy.run_path(str(CGPU))["ownership_action"]
+            globals_ = action.__globals__
+            original = globals_["exec_py"]
+            def occupy_after_probe(session, code, **kwargs):
+                rc = original(session, code, **kwargs)
+                if "__CGPU_IDLE_" in code:
+                    self.occupy_kernel(4)
+                return rc
+            globals_["exec_py"] = occupy_after_probe
+            with self.assertRaises(SystemExit):
+                action(SimpleNamespace(session="s", token="a" * 32, timeout=1))
+        time.sleep(4)  # Let the abandoned claim cell leave the kernel queue.
+        self.assertFalse((self.vm() / "content/.cgpu-session-owner").exists())
+
+    def test_claim_refuses_lost_job_that_may_still_run(self):
+        self.cgpu("up", "s", "cpu")
+        self.cgpu("start", "s", "--", "sleep", "30")
+        job_dir = self.vm() / self.record()["dir"].lstrip("/")
+        (job_dir / "beat").write_text(str(time.time() - 1000))
+        r = self.cgpu("claim", "s", "a" * 32, ok=False)
+        self.assertIn("lost its kernel cell", r.stderr)
+        self.assertIn("may still be running", r.stderr)
+        self.assertFalse((self.vm() / "content/.cgpu-session-owner").exists())
 
     def test_exec_watchdog_kills_a_hung_client(self):
         self.cgpu("up", "s", "T4")

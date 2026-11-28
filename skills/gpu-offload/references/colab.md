@@ -43,11 +43,14 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
 - A `colab exec` client can print `Connection was lost` and then hang past its
   `--timeout` (2026-11-28, right after `up` allocated a G4). `exec_py` kills the
   client `EXEC_GRACE` seconds past the timeout, and `up` retries its fingerprint
-  check 3 times. If an allocated session is ever left without its driver, resume
-  on it rather than `down` + re-allocate (the cLLM runner has `--attach`).
+  check 3 times on the same VM. A GPU check requires `nvidia-smi` to exit zero
+  with a nonempty result; CPU allocations do not require it. If an allocated
+  session is ever left without its driver, resume on it rather than `down` +
+  re-allocate (the cLLM runner has `--attach`).
 - Plain `--gpu A100` returned 503 while `A100 --high-mem` allocated. The first
-  exec on that A100 then hung without starting. If `up` fails or hangs, run
-  `cgpu down`. Switch to another type only if the justification still holds
+  exec on that A100 then hung without starting. If `up` fails or hangs, check
+  ownership before shutdown; leave the VM alone if another driver or job may
+  be using it. Switch to another type only if the justification still holds
   for that card (for example, the job fits the A100's VRAM, which
   `nvidia-smi` shows). Say that you switched and why, unless the user already
   said what to fall back to. `cgpu up` already refuses unknown GPU
@@ -193,8 +196,20 @@ learned:
   2026-11-11: 45 s from allocation to job start, 11 s to download and hash 52
   files from a private Kaggle dataset, 4 s for retrieval and shutdown.
 - **`up` can fail after it has allocated** (its GPU check is a separate exec).
-  Treat the VM as allocated from the moment `up` is called and run `down` on
-  that path, except when `up` refused because the name already exists.
+  Before cleaning up an allocated VM, establish that the driver owns it; a
+  concurrent driver may have attached after allocation. On an uncertain
+  allocation or claim, leave the session running for inspection.
+- **Claim the VM before setup or attaching.** The cLLM driver uses `cgpu claim
+  SESSION TOKEN`: an idle-kernel probe precedes an exclusive
+  `/content/.cgpu-session-owner` file. A queued probe is read-only, and a
+  queued claim expires using the VM's monotonic clock. An existing claim or
+  uncertain response must prevent uploads and shutdown. After verified results,
+  shutting down removes the claim with the VM; if keeping the VM, use `cgpu
+  release SESSION TOKEN`. A failed or interrupted driver may leave a claim;
+  inspect it and release its token only after confirming no job or driver owns
+  the VM. These claims coordinate cooperating drivers only: direct `cgpu` and
+  raw Colab commands, older drivers, and detached background processes are not
+  blocked by the marker.
 - **After `start` is called, assume a job may be running** even if `start`
   returned an error, and leave the VM up rather than shutting it down.
 - **`cgpu wait`'s exit code alone doesn't prove the job ended.** It returns
