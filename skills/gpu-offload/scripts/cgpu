@@ -354,7 +354,7 @@ def cmd_up(a):
             # Only the capacity refusal is retried; any other error (auth, plan,
             # too many assignments) fails at once. The GPU type never changes.
             print(f"[cgpu] {time.strftime('%H:%M:%S')} {gpu} has no capacity (attempt "
-                  f"{attempt}); retrying in {a.retry_every:.0f}s")
+                  f"{attempt}); retrying in {a.retry_every:.0f}s", flush=True)
             time.sleep(a.retry_every)
             attempt += 1
             continue
