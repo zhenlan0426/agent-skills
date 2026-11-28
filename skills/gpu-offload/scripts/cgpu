@@ -15,7 +15,7 @@ Commands after `--` are an argv, run without a shell. For pipes, globs or `&&`,
 say so explicitly: `-- bash -c 'pip list | grep torch'`.
 
 Usage:
-  cgpu up SESSION GPU [--high-mem] [--retry-for 3h] [--retry-every 10m]
+  cgpu up SESSION GPU [--high-mem] [--retry-for 6h] [--retry-every 2m]
                                           GPU: T4 L4 G4 A100 H100 cpu; --retry-for keeps
                                           retrying "no capacity" refusals (never another GPU)
   cgpu push SESSION LOCAL [REMOTE]        file or dir (dirs are tarred); default /content/<basename>
@@ -820,8 +820,8 @@ def main():
     s.add_argument("--high-mem", action="store_true")
     s.add_argument("--retry-for", type=duration, default=0,
                    help="keep retrying no-capacity refusals for this long (e.g. 3h)")
-    s.add_argument("--retry-every", type=duration, default=600,
-                   help="pause between capacity retries (default 10m)")
+    s.add_argument("--retry-every", type=duration, default=120,
+                   help="pause between capacity retries (default 2m)")
     s.set_defaults(f=cmd_up)
     s = sub.add_parser("push"); s.add_argument("session"); s.add_argument("local")
     s.add_argument("remote", nargs="?"); s.set_defaults(f=cmd_push)

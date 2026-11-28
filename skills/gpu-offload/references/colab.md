@@ -37,8 +37,8 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
 - When a GPU type has no capacity, `colab new` fails with `ColabRequestError
   ... Service Unavailable` (HTTP 503) and nothing is allocated or billed. G4
   hit this repeatedly in Nov 2026 and came back within the hour. To wait it
-  out on the same type, use `cgpu up SESSION G4 --retry-for 3h` (retries every
-  `--retry-every`, default 10m; other errors fail at once). It exits 75 if
+  out on the same type, use `cgpu up SESSION G4 --retry-for 6h` (retries every
+  `--retry-every`, default 2m; other errors fail at once). It exits 75 if
   capacity never appears. Don't hand-roll a retry loop around `up`.
 - Plain `--gpu A100` returned 503 while `A100 --high-mem` allocated. The first
   exec on that A100 then hung without starting. If `up` fails or hangs, run
@@ -61,7 +61,7 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
 ## Workflow
 
 ```bash
-cgpu up job1 G4 --retry-for 3h                 # recommended; add --high-mem only when needed
+cgpu up job1 G4 --retry-for 6h                 # recommended; add --high-mem only when needed
 cgpu push job1 ./myproj                        # -> /content/myproj (.git, venvs, caches excluded)
 cgpu secrets job1 kaggle hf                    # only if the job needs them
 cgpu setup job1 -- -r /content/myproj/requirements.txt   # keeps the image's torch; see environments.md
