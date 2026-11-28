@@ -34,6 +34,22 @@ def refuse_capacity():
     return n > 0
 
 
+def lose_exec():
+    """Drop the first $FAKE_COLAB_EXEC_LOST `exec` connections as 0.7.4 does; with
+    $FAKE_COLAB_EXEC_LOST_HANG the client then hangs instead of exiting, as seen live."""
+    left = ROOT / "exec-lost-left"
+    if not left.exists():
+        left.write_text(os.environ.get("FAKE_COLAB_EXEC_LOST", "0"))
+    n = int(left.read_text())
+    left.write_text(str(max(n - 1, 0)))
+    if n <= 0:
+        return
+    print("RuntimeError: Connection was lost.", flush=True)
+    if os.environ.get("FAKE_COLAB_EXEC_LOST_HANG"):
+        time.sleep(3600)
+    sys.exit(1)
+
+
 def names():
     return json.loads(MAP.read_text()) if MAP.exists() else {}
 
@@ -152,6 +168,7 @@ def main():
         shutil.rmtree(p) if p.is_dir() else p.unlink()
     elif cmd == "exec":
         vm = vm_dir(s)
+        lose_exec()
         cell = vm / f"cell-{uuid.uuid4().hex[:8]}.py"
         cell.write_text(rewrite(vm, Path(opt(rest, "-f")).read_text()))
         out = cell.with_suffix(".out")

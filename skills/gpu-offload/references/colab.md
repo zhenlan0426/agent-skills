@@ -40,6 +40,11 @@ below). It wraps `colab --auth=oauth2 ...`. `cgpu --help` lists commands, and
   out on the same type, use `cgpu up SESSION G4 --retry-for 6h` (retries every
   `--retry-every`, default 2m; other errors fail at once). It exits 75 if
   capacity never appears. Don't hand-roll a retry loop around `up`.
+- A `colab exec` client can print `Connection was lost` and then hang past its
+  `--timeout` (2026-11-28, right after `up` allocated a G4). `exec_py` kills the
+  client `EXEC_GRACE` seconds past the timeout, and `up` retries its fingerprint
+  check 3 times. If an allocated session is ever left without its driver, resume
+  on it rather than `down` + re-allocate (the cLLM runner has `--attach`).
 - Plain `--gpu A100` returned 503 while `A100 --high-mem` allocated. The first
   exec on that A100 then hung without starting. If `up` fails or hangs, run
   `cgpu down`. Switch to another type only if the justification still holds

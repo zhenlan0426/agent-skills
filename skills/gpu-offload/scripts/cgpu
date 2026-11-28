@@ -46,6 +46,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from functools import partial
@@ -111,6 +112,12 @@ def colab(*args, capture=False, check=True, stdin=None, **kw):
     return r
 
 
+# `colab exec --timeout` bounds the cell, not the client: after "Connection was
+# lost" one client hung 20+ min past a 120s timeout (2026-11-28). A watchdog
+# kills the client this long after --timeout.
+EXEC_GRACE = 60
+
+
 def exec_py(session, code, timeout="600", check=True):
     """Run Python in the kernel, stream its output, return an exit code.
 
@@ -128,6 +135,9 @@ def exec_py(session, code, timeout="600", check=True):
         p = subprocess.Popen(["colab", f"--auth={AUTH}", "exec", "-s", session,
                               "--timeout", timeout, "-f", f.name],
                              stdout=subprocess.PIPE, text=True)
+        watchdog = threading.Timer(float(timeout) + EXEC_GRACE, p.kill)
+        watchdog.daemon = True
+        watchdog.start()
         rc = 1
         for line in p.stdout:
             before, found, after = line.partition(mark)
@@ -139,6 +149,10 @@ def exec_py(session, code, timeout="600", check=True):
                 sys.stdout.write(line)
         if p.wait() != 0:
             rc = p.returncode
+        if not watchdog.is_alive() and p.returncode == -9:
+            print(f"[cgpu] `colab exec` hung {EXEC_GRACE}s past its {timeout}s timeout; killed it",
+                  file=sys.stderr)
+        watchdog.cancel()
     finally:
         os.unlink(f.name)
     if check and rc != 0:
@@ -369,10 +383,19 @@ def cmd_up(a):
         die(f"could not allocate {gpu}; it may be unavailable right now or not "
             "in this plan. Ask the user before trying a different GPU.", r.returncode)
     job_file(a.session).unlink(missing_ok=True)  # a fresh VM has no jobs
-    exec_py(a.session, "import shutil, subprocess\nprint(shutil.which('nvidia-smi') and "
-            "subprocess.run(['nvidia-smi','--query-gpu=name,memory.total',"
-            "'--format=csv,noheader'],capture_output=True,text=True).stdout or 'no GPU')",
-            timeout="120")
+    # The VM is allocated (and billed) now; a dropped connection here is retried
+    # rather than failing `up` and throwing away capacity that took hours to get.
+    for attempt in range(1, 4):
+        rc = exec_py(a.session, "import shutil, subprocess\nprint(shutil.which('nvidia-smi') and "
+                     "subprocess.run(['nvidia-smi','--query-gpu=name,memory.total',"
+                     "'--format=csv,noheader'],capture_output=True,text=True).stdout or 'no GPU')",
+                     timeout="120", check=False)
+        if rc == 0:
+            break
+        print(f"[cgpu] fingerprint check failed (exit {rc}, attempt {attempt}/3)", flush=True)
+    else:
+        die(f"{a.session} was allocated but never answered the fingerprint check; "
+            f"`cgpu down {a.session}` unless you want to inspect it", rc)
     colab("usage")
 
 

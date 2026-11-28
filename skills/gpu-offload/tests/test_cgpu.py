@@ -222,6 +222,27 @@ class CgpuTest(unittest.TestCase):
         self.assertIn(f"no G4 capacity after {attempts} attempt(s)", r.stderr)
         self.assertFalse((self.fake / "allocations.log").exists())
 
+    def test_up_retries_fingerprint_after_lost_connection(self):
+        r = self.cgpu("up", "s", "G4", env={"FAKE_COLAB_EXEC_LOST": "1"})
+        self.assertIn("fingerprint check failed (exit 1, attempt 1/3)", r.stdout)
+        self.assertEqual([c[0] for c in self.calls()].count("new"), 1)
+
+    def test_up_fails_after_three_lost_fingerprints(self):
+        r = self.cgpu("up", "s", "G4", ok=False, env={"FAKE_COLAB_EXEC_LOST": "9"})
+        self.assertIn("never answered the fingerprint check", r.stderr)
+
+    def test_exec_watchdog_kills_a_hung_client(self):
+        self.cgpu("up", "s", "T4")
+        (self.fake / "exec-lost-left").write_text("1")  # `up` already used its own count
+        env = {**self.env, "FAKE_COLAB_EXEC_LOST_HANG": "1"}
+        with patch.dict(os.environ, env, clear=True):
+            exec_py = runpy.run_path(str(CGPU))["exec_py"]
+            exec_py.__globals__["EXEC_GRACE"] = 0.5
+            start = time.monotonic()
+            rc = exec_py("s", "print(1)", timeout="0.5", check=False)
+        self.assertEqual(rc, -9)
+        self.assertLess(time.monotonic() - start, 30)
+
     def test_up_without_retry_fails_once(self):
         r = self.cgpu("up", "s", "G4", ok=False, env={"FAKE_COLAB_NO_CAPACITY": "1"})
         self.assertEqual(r.returncode, 75)
